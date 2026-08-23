@@ -1,8 +1,239 @@
-# LIFT_MANIFEST.toml — canonical source-of-truth for every ported file.
-# Read by scripts/generate_notice.py to emit NOTICE.
-# See docs/devharness-spec.md §14.3.
+# LIFT_MANIFEST.toml — canonical, machine-readable provenance for every file
+# in devharness that was ported or adapted from an upstream open-source project.
+#
+# This file is the single source of truth. `scripts/generate_notice.py` reads
+# it to regenerate `NOTICE` and the ported-file tables in
+# `THIRD_PARTY_LICENSES.md`. CI should verify that:
+#   (a) every ported file's docstring header cites the upstream shown here, and
+#   (b) `NOTICE` + `THIRD_PARTY_LICENSES.md` agree with this manifest.
+#
+# Spec reference: docs/devharness-spec.md §14.3
 
-# [[lifts]]
-# dest = "devharness/sandbox/_jail.py"
-# source_repo = "visa/visa-vulnerability-agentic-harness"
-# ...
+[meta]
+schema_version = 1
+generated_by   = "human + subagent lift pass"
+ported_on      = "2026-08-23"
+
+# -----------------------------------------------------------------------------
+# VVAH — Apache 2.0
+# -----------------------------------------------------------------------------
+
+[[lifts]]
+dest          = "devharness/sandbox/_jail.py"
+source_repo   = "visa/visa-vulnerability-agentic-harness"
+source_path   = "vvaharness/backends/localtools.py"
+source_commit = "3d972f679d8f5e3838b394edee0b5ea9c626b0fb"
+license       = "Apache-2.0"
+strategy      = "adapt"
+source_loc    = 288
+dest_loc      = 160
+adaptations   = [
+  "Dropped LLM tool schema surface (_SCHEMAS, _EXEC, schemas_for, anthropic_schemas_for, execute, supported)",
+  "Dropped vvaharness.report.redact import — redaction is a separate layer in devharness",
+  "Trimmed Anthropic/OpenAI-specific docstring rationale; kept jail + regex-cap security notes",
+]
+
+[[lifts]]
+dest          = "devharness/session/store.py"
+source_repo   = "visa/visa-vulnerability-agentic-harness"
+source_path   = "vvaharness/orchestrator/store.py"
+source_commit = "3d972f679d8f5e3838b394edee0b5ea9c626b0fb"
+license       = "Apache-2.0"
+strategy      = "adapt"
+source_loc    = 548
+dest_loc      = 348
+adaptations   = [
+  "Schema replaced with spec §4.1 tables: turns, approvals, snapshots, env",
+  "Per-session DB path ~/.devharness/sessions/{session_id}/rollout.db (env override DEVHARNESS_STATE_DIR)",
+  "Dropped VVAH-specific runs/checkpoints/callgraph tables and save_callgraph/load_callgraph helpers",
+  "Payloads use plain dict[str, Any] serialised via stdlib json.dumps(sort_keys=True) — TODO wire pydantic later",
+]
+
+[[lifts]]
+dest          = "devharness/config/__init__.py"
+source_repo   = "visa/visa-vulnerability-agentic-harness"
+source_path   = "vvaharness/config/__init__.py"
+source_commit = "3d972f679d8f5e3838b394edee0b5ea9c626b0fb"
+license       = "Apache-2.0"
+strategy      = "adapt"
+source_loc    = 291
+dest_loc      = 171
+adaptations   = [
+  "Primary loader is TOML via stdlib tomllib; .yaml/.yml fall back to PyYAML (soft-imported)",
+  "Overlay filename is config.local.{toml,yaml,yml}; opt-out env var DEVHARNESS_NO_LOCAL_CONFIG",
+  "Dropped VVAH _STEP_DEFAULTS block, apply_step1_overlay, and profile-registration decorators",
+  "Kept _ENV_PAT, _expand_env, _expand, _deep_merge, Config wrapper",
+]
+
+[[lifts]]
+dest          = "devharness/redaction/rules.py"
+source_repo   = "visa/visa-vulnerability-agentic-harness"
+source_path   = "vvaharness/report/redact.py"
+source_commit = "3d972f679d8f5e3838b394edee0b5ea9c626b0fb"
+license       = "Apache-2.0"
+strategy      = "adapt"
+source_loc    = 335
+dest_loc      = 302
+adaptations   = [
+  "Public redact(text) -> tuple[str, dict] per spec §4.9 (no non-thread-safe last_counts sidechannel)",
+  "Added add_custom_pattern(name, regex) and clear_custom_patterns() for operator-supplied rules",
+  "Custom rules run AFTER built-ins to avoid permissive regexes swallowing validator-gated bytes",
+  "Dropped redact_tree JSON walker — scrubbing happens at the tool-result string boundary",
+]
+
+# tokens.py contributes partially to observability/cost.py; combined lift entry
+# is recorded below with the Hermes billing_usage.py side.
+
+# -----------------------------------------------------------------------------
+# Hermes Agent — MIT
+# -----------------------------------------------------------------------------
+
+[[lifts]]
+dest          = "devharness/tools/impl/git/apply_patch.py"
+source_repo   = "NousResearch/hermes-agent"
+source_path   = "tools/patch_parser.py"
+source_commit = "f293e7206b4ddd66042329442c6afebc19a8808d"
+license       = "MIT"
+strategy      = "adapt"
+source_loc    = 737
+dest_loc      = 598
+adaptations   = [
+  "Dropped PatchResult (hermes file_operations wrapper), LSP diagnostics propagation, and lint-delta plumbing",
+  "Inlined a minimal _fuzzy_find_and_replace (strict + whitespace-tolerant), replacing tools.fuzzy_match dep",
+  "Added _RootedFS jail so writes/deletes/moves cannot escape the root directory",
+  "Kept validate-then-apply two-phase safety, CRLF tolerance, and multi-file MOVE overlay",
+]
+
+[[lifts]]
+dest          = "devharness/tools/registry.py"
+source_repo   = "NousResearch/hermes-agent"
+source_path   = "tools/registry.py"
+source_commit = "f293e7206b4ddd66042329442c6afebc19a8808d"
+license       = "MIT"
+strategy      = "extract-pattern"
+source_loc    = 1335
+dest_loc      = 380
+adaptations   = [
+  "New ToolSpec dataclass per spec §4.4 (name, category, sandbox_class, approval_class, timeout, parallel_safe, handler, description, schema)",
+  "AST scanner extended to detect bare register(), registry.register(), and @register decorator forms",
+  "Discovery cache defaults to $DEVHARNESS_HOME/cache/tool_discovery.json → XDG → ~/.cache",
+  "Dropped ~950 LOC of plugin override policies, MCP dynamic refresh, check_fn TTL cache, toolset aliases, per-profile scoped overlays",
+]
+
+[[lifts]]
+dest          = "devharness/loop/steps/tool_dispatch.py"
+source_repo   = "NousResearch/hermes-agent"
+source_path   = "agent/tool_dispatch_helpers.py"
+source_commit = "f293e7206b4ddd66042329442c6afebc19a8808d"
+license       = "MIT"
+strategy      = "adapt"
+source_loc    = 803
+dest_loc      = 406
+adaptations   = [
+  "New public plan_batches(tool_calls, tool_specs) chunks parallel segments to MAX_PARALLEL=8 per spec §4.5",
+  "Parallel-safe/path-scoped hint sets derive from ToolSpec.parallel_safe and .category at plan time",
+  "Tool-call normalization accepts either OpenAI-style function.name/arguments objects or plain dicts",
+  "Added git push to destructive patterns; added apply_patch to writer set",
+  "Dropped multimodal envelope helpers, threat-pattern wrapping, MCP parallel probe, and tool_result_storage plumbing (~500 LOC)",
+]
+
+[[lifts]]
+dest          = "devharness/loop/steps/approval_gate.py"
+source_repo   = "NousResearch/hermes-agent"
+source_path   = "tools/approval.py"
+source_commit = "f293e7206b4ddd66042329442c6afebc19a8808d"
+license       = "MIT"
+strategy      = "extract-pattern"
+source_loc    = 5498
+dest_loc      = 245
+adaptations   = [
+  "Selective extraction via grep-then-slice; ~360 source LOC examined out of 5498",
+  "Renamed modes manual/smart/off → spec's suggest/auto-edit/auto; decision tree rewritten per spec §10.2",
+  "Dangerous-pattern list curated to 20 core entries (rm/chmod/mkfs/dd/SQL/curl-pipe-shell/base64-exec/sudo/git-force-push)",
+  "Cache stores full Decision; only approved re-serves as cached_approved (denials are not sticky)",
+  "Skipped: Slack/Telegram/Discord notify, gateway queue, YOLO env freeze, plugin escalation, cron sub-modes",
+  "Fail-closed when no _prompt_handler installed and a prompt is required",
+]
+
+[[lifts]]
+dest          = "devharness/loop/steps/result_spillover.py"
+source_repo   = "NousResearch/hermes-agent"
+source_path   = "tools/tool_result_storage.py"
+source_commit = "f293e7206b4ddd66042329442c6afebc19a8808d"
+license       = "MIT"
+strategy      = "adapt"
+source_loc    = 450
+dest_loc      = 343
+adaptations   = [
+  "Public maybe_spillover(result, *, session_id, turn_id, tool_name, call_id, threshold=100_000) per §4.11",
+  "Storage root ~/.devharness/sessions/{session_id}/spillover/ (respects $DEVHARNESS_HOME)",
+  "Deterministic filenames {turn_id}_{tool_name}_{call_id}.txt per spec",
+  "Prune guard per-session (_pruned_sessions) rather than single global process flag",
+  "Dropped remote-sandbox plumbing (_write_to_sandbox, heredoc markers) — devharness has its own SandboxRunner",
+  "Added iter_persisted_paths helper for the loop's compaction step",
+]
+
+[[lifts]]
+dest          = "devharness/loop/steps/prompt_injection_scan.py"
+source_repo   = "NousResearch/hermes-agent"
+source_path   = "tools/threat_patterns.py"
+source_commit = "f293e7206b4ddd66042329442c6afebc19a8808d"
+license       = "MIT"
+strategy      = "adapt"
+source_loc    = 284
+dest_loc      = 210
+adaptations   = [
+  "Public API reshaped to scan_for_injection(text) -> list[Finding] and sanitize(text) -> (str, list[Finding])",
+  "Added explicit [SYSTEM], <|system|>, <|im_start|>system bracket/ChatML markers",
+  "Collapsed upstream all/context/strict scope split into one unified list",
+  "Spans + merged overlapping matches so sanitize rewrites don't nest",
+]
+
+[[lifts]]
+dest          = "devharness/providers/base.py"
+source_repo   = "NousResearch/hermes-agent"
+source_path   = "providers/base.py"
+source_commit = "f293e7206b4ddd66042329442c6afebc19a8808d"
+license       = "MIT"
+strategy      = "adapt"
+source_loc    = 267
+dest_loc      = 245
+adaptations   = [
+  "Added spec §4.3 Provider Protocol (stream, supports_prompt_cache, supports_reasoning, price_per_1k) alongside ProviderProfile",
+  "Added supports_prompt_cache / supports_reasoning capability flags to ProviderProfile",
+  "Renamed _profile_user_agent → profile_user_agent; UA now devharness/<version>",
+  "Swapped hermes_cli.urllib_security.open_credentialed_url for stdlib urlopen with TODO for devharness helper",
+  "Dropped resolve_aux_model (LangChain-adjacent) and hermes credential-pool references",
+]
+
+# -----------------------------------------------------------------------------
+# Combined lifts (single dest file, multiple sources)
+# -----------------------------------------------------------------------------
+
+[[lifts]]
+dest          = "devharness/observability/cost.py"
+strategy      = "combine"
+combined_from = [
+  { source_repo = "visa/visa-vulnerability-agentic-harness", source_path = "vvaharness/util/tokens.py", source_commit = "3d972f679d8f5e3838b394edee0b5ea9c626b0fb", license = "Apache-2.0", source_loc = 106 },
+  { source_repo = "NousResearch/hermes-agent",               source_path = "agent/billing_usage.py",   source_commit = "f293e7206b4ddd66042329442c6afebc19a8808d", license = "MIT",         source_loc = 323 },
+]
+dest_loc      = 249
+adaptations   = [
+  "Merged VVAH's thread-safe _TokenCounter (lock, phase() contextmanager, per-phase bucket dict) with Hermes' UsageBar render helpers",
+  "VVAH accounting kept: fresh input + cache-write bill at input rate; cache-read tracked separately; by_phase bucket dict",
+  "Pricing lookup ported from Hermes' per-provider approach: keys are 'provider/model' with fallback to bare model",
+  "load_pricing_table reads pricing.toml via stdlib tomllib; returns {} on missing/malformed file",
+  "Skipped: VVAH stage-tag names; Hermes Nous-portal paid_service_access_info, subscription_credits_remaining, LOW_BALANCE_THRESHOLD_USD, UsageModel classifier",
+  "Dual attribution header cites both sources",
+]
+
+# -----------------------------------------------------------------------------
+# Design references — NO code lifted; recorded here for CI cross-check only
+# -----------------------------------------------------------------------------
+
+[design_references]
+codex           = { license = "Apache-2.0", upstream = "https://github.com/openai/codex",           reference = "codex-rs/apply-patch/ V4A grammar; codex-rs/linux-sandbox/ Landlock+bwrap pattern" }
+goose           = { license = "Apache-2.0", upstream = "https://github.com/block/goose",             reference = "goose-agent/machine.rs Step[] state-machine engine" }
+deepagents      = { license = "MIT",        upstream = "https://github.com/langchain-ai/deepagents", reference = "middleware composition; summarization pattern; SubAgent TypedDict shape" }
+open-swe        = { license = "MIT",        upstream = "https://github.com/langchain-ai/open-swe",   reference = "deterministic thread-id-from-invocation-surface pattern" }
+bedrock-engineer = { license = "MIT-0",     upstream = "https://github.com/aws-samples/bedrock-engineer", reference = "PLAN/ACT dual-mode UX; TUI patterns" }

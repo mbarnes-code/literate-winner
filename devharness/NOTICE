@@ -1,5 +1,83 @@
 devharness
-Copyright 2026 <maintainer>
+Copyright 2026 The devharness contributors
 
-TODO: auto-generated from scripts/LIFT_MANIFEST.toml by scripts/generate_notice.py.
-See docs/devharness-spec.md §6.5 and §14.
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use
+this product except in compliance with the License. You may obtain a copy of
+the License at http://www.apache.org/licenses/LICENSE-2.0
+
+===============================================================================
+Third-party code incorporated into this product
+===============================================================================
+
+This product incorporates code adapted from the following upstream projects.
+Each ported file carries an in-source attribution header. Machine-readable
+provenance is recorded in scripts/LIFT_MANIFEST.toml. Full license grants and
+per-file provenance appear in THIRD_PARTY_LICENSES.md.
+
+-------------------------------------------------------------------------------
+Visa Vulnerability Agentic Harness (vvaharness)
+  License:  Apache License 2.0
+  Upstream: https://github.com/visa/visa-vulnerability-agentic-harness
+  Commit:   3d972f679d8f5e3838b394edee0b5ea9c626b0fb
+-------------------------------------------------------------------------------
+
+The following upstream NOTICE is forwarded verbatim, per Apache 2.0 section 4(d):
+
+    vvaharness
+
+    Copyright 2026 Visa, Inc.
+
+    This product is licensed under the Apache License, Version 2.0 (the
+    "License"); you may not use this product except in compliance with the
+    License. You may obtain a copy of the License at:
+
+        http://www.apache.org/licenses/LICENSE-2.0
+
+    This product depends on third-party software components. A summary of
+    those dependencies and their licenses is provided in
+    THIRD_PARTY_LICENSES.md. Those dependencies are obtained from their
+    respective distributors at install time and are not redistributed as
+    part of this repository.
+
+Adapted files incorporated into devharness:
+  - vvaharness/backends/localtools.py   -> devharness/sandbox/_jail.py
+  - vvaharness/orchestrator/store.py    -> devharness/session/store.py
+  - vvaharness/config/__init__.py       -> devharness/config/__init__.py
+  - vvaharness/report/redact.py         -> devharness/redaction/rules.py
+  - vvaharness/util/tokens.py           -> devharness/observability/cost.py (partial)
+
+-------------------------------------------------------------------------------
+Hermes Agent (hermes-agent)
+  License:  MIT License
+  Copyright (c) 2025 Nous Research
+  Upstream: https://github.com/NousResearch/hermes-agent
+  Commit:   f293e7206b4ddd66042329442c6afebc19a8808d
+-------------------------------------------------------------------------------
+
+Adapted files incorporated into devharness:
+  - tools/patch_parser.py               -> devharness/tools/impl/git/apply_patch.py
+  - tools/registry.py                   -> devharness/tools/registry.py
+  - agent/tool_dispatch_helpers.py      -> devharness/loop/steps/tool_dispatch.py
+  - tools/approval.py                   -> devharness/loop/steps/approval_gate.py
+  - tools/tool_result_storage.py        -> devharness/loop/steps/result_spillover.py
+  - tools/threat_patterns.py            -> devharness/loop/steps/prompt_injection_scan.py
+  - providers/base.py                   -> devharness/providers/base.py
+  - agent/billing_usage.py              -> devharness/observability/cost.py (partial)
+
+===============================================================================
+Design references (no code lifted)
+===============================================================================
+
+The following upstream projects informed devharness's design but were not
+copied. They are acknowledged here in gratitude, not as a legal requirement.
+
+  - OpenAI Codex     (Apache 2.0) - https://github.com/openai/codex
+                       Reference: codex-rs/apply-patch/, codex-rs/linux-sandbox/
+  - Block Goose      (Apache 2.0) - https://github.com/block/goose
+                       Reference: state-machine step engine
+  - DeepAgents       (MIT)        - https://github.com/langchain-ai/deepagents
+                       Reference: middleware composition, summarization pattern
+  - Open SWE         (MIT)        - https://github.com/langchain-ai/open-swe
+                       Reference: deterministic thread-id-from-surface pattern
+  - Bedrock Engineer (MIT-0)      - https://github.com/aws-samples/bedrock-engineer
+                       Reference: TUI + PLAN/ACT dual-mode UX
