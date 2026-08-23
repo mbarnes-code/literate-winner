@@ -1,0 +1,8 @@
+# LIFT_MANIFEST.toml — canonical source-of-truth for every ported file.
+# Read by scripts/generate_notice.py to emit NOTICE.
+# See docs/devharness-spec.md §14.3.
+
+# [[lifts]]
+# dest = "devharness/sandbox/_jail.py"
+# source_repo = "visa/visa-vulnerability-agentic-harness"
+# ...

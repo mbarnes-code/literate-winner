@@ -1,0 +1,6 @@
+# Token pricing table. Spec §4.13.
+
+[anthropic.claude-sonnet-4-6]
+input = 3.00  # $ per 1M tokens
+output = 15.00
+# TODO: fill in all supported models.

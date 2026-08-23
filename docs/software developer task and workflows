@@ -1,0 +1,161 @@
+Core Developer Workflows & Task Breakdown
+1. Code Quality, Formatting & Static Analysis
+
+All developers rely on automated tools to enforce style rules, spot potential runtime bugs, and verify type safety before code reaches review.
+
+    Tasks:
+
+        Auto-formatting source code to match project standards.
+
+        Running static analysis/linters to catch bad patterns or unused variables.
+
+        Checking type safety across modified files.
+
+        Scanning repositories for leaked secrets or vulnerable dependencies.
+
+    Deterministic Open-Source Tools:
+
+        Formatters: prettier, ruff format, black, gofmt, rustfmt.
+
+        Linters & Type Checkers: eslint, ruff check, mypy, tsc --noEmit, clippy.
+
+        Security Scanners: gitleaks, semgrep, trivy, pip-audit, npm audit.
+
+2. Testing & Verification
+
+Before committing changes or opening a pull request, developers must verify that existing behavior remains intact and new features function as intended.
+
+    Tasks:
+
+        Executing the full unit and integration test suite.
+
+        Running a targeted single test file or specific test case during active iteration.
+
+        Inspecting test coverage reports to identify missing edge cases.
+
+    Deterministic Open-Source Tools:
+
+        Test Runners: pytest, vitest / jest, cargo test, go test.
+
+        Coverage Extractors: coverage.py, c8 / istanbul, tarpaulin.
+
+3. Debugging & Codebase Exploration
+
+Debugging involves reading error output, identifying where a failure occurred in the codebase, and narrowing down when a regression was introduced.
+
+    Tasks:
+
+        Searching for function definitions, variable usages, or error strings across files.
+
+        Parsing JSON/structured log dumps to trace state flow.
+
+        Finding the exact commit that introduced a bug (regression hunting).
+
+    Deterministic Open-Source Tools:
+
+        Code Search: ripgrep (rg), fd.
+
+        Log & Data Processing: jq, yq.
+
+        Git History Search: git log -S, git bisect, git blame.
+
+4. Git & Version Control Operations
+
+Managing version history cleanly is universal. AI harnesses excel at turning raw file diffs into structured commits and branch workflows.
+
+    Tasks:
+
+        Reviewing unstaged vs. staged diffs (git diff).
+
+        Creating semantic, structured commit messages (e.g., Conventional Commits).
+
+        Branch management (checkout, rebase, merge).
+
+        Resolving simple merge conflicts or applying patches.
+
+    Deterministic Open-Source Tools:
+
+        Version Control: git.
+
+        Platform Integration: gh (GitHub CLI) or glab (GitLab CLI) for managing issues and Pull Requests from the shell.
+
+5. AST Refactoring & Code Transformation
+
+When modifying multi-file projects, developers perform structural edits (renaming functions, moving files, updating imports) that require semantic awareness beyond simple regex.
+
+    Tasks:
+
+        Renaming structural symbols across an entire repository.
+
+        Removing dead or unreachable code.
+
+        Updating deprecated API signatures across call sites.
+
+    Deterministic Open-Source Tools:
+
+        AST Parsers & Search: ast-grep (sg), tree-sitter-cli.
+
+        Dead Code Cleaners: knip (JS/TS), autoflake (Python).
+
+6. Environment & Dependency Management
+
+Configuring dependencies and standardizing execution environments ensures the harness operates in a controlled, predictable space.
+
+    Tasks:
+
+        Bootstrapping project dependencies from lockfiles.
+
+        Adding or removing package dependencies.
+
+        Containerizing or spinning up isolated local service instances (e.g., local databases).
+
+    Deterministic Open-Source Tools:
+
+        Package Managers: uv / poetry (Python), pnpm / npm (JS/TS), cargo (Rust).
+
+        Environment Isolation: docker, docker-compose.
+
+        Runtime Version Managers: mise or asdf.
+
+7. Documentation & Spec Maintenance
+
+Keeping project documentation, API schemas, and changelogs up to date with code changes.
+
+    Tasks:
+
+        Generating or validating OpenAPI / Swagger specs from code.
+
+        Generating CHANGELOG entries from commit history.
+
+        Checking for broken links or outdated code snippets in Markdown files.
+
+    Deterministic Open-Source Tools:
+
+        Changelogs: git-cliff.
+
+        Schema Validation: redocly-cli, swagger-cli.
+
+
+Most Requested Programming Languages
+
+The tech stack has largely stabilized around a few dominant ecosystems, with Python leading the charge due to the massive surge in AI and data engineering roles.  
+
+Python: Shows up in nearly 98% of backend, data, and AI-related job postings. It is the undisputed baseline for machine learning and LLM integration.  
+
+SQL: While rarely a standalone job title, SQL is the most requested secondary skill across all developer levels.  
+
+JavaScript / TypeScript: Essential for full-stack and frontend roles. Pure frontend jobs are seeing pressure from AI tools, so TypeScript is highly preferred for its type safety and reliability.  
+
+Java / C#: The backbone of enterprise architecture. Roles asking for these languages frequently pair them with cloud platforms like AWS or Azure.  
+
+Aggregate Responsibilities by Level
+
+The market has shifted heavily toward practical, verifiable results over theoretical knowledge. 
+
+Here is what companies expect you to actually do on the job:  SeniorityCore ResponsibilitiesDifferentiating Skills in 2026
+
+Beginner / JuniorBug fixes, writing unit tests, building basic features, and operating version control (Git).Treating AI (like Copilot) as a leverage tool for productivity, not a crutch.
+
+Mid-LevelBuilding API endpoints, managing data pipelines, executing database migrations, and mentoring junior devs.Practical experience with LLM integration, Retrieval-Augmented Generation (RAG), or cloud-native infrastructure.
+
+Senior / PrincipalDefining technical direction, designing distributed systems architecture, and optimizing inference pipelines.Reasoning about trade-offs, reducing latency at scale, and designing GPU clusters.

@@ -1,0 +1,4 @@
+# Dockerfile.dev — developer container.
+
+FROM python:3.12-slim
+# TODO: install dev dependencies (uv, ruff, mypy, pytest).

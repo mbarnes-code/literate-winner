@@ -1,0 +1,8 @@
+# Devharness default configuration. Spec §9.2.
+
+[session]
+id_strategy = "uuid"
+
+[budget]
+max_turns = 100
+# TODO: full defaults per spec §9.2.

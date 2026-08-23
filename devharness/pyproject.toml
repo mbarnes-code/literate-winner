@@ -1,0 +1,6 @@
+# TODO: full dependency list is defined in docs/devharness-spec.md §7.2.
+
+[project]
+name = "devharness"
+version = "0.0.0"
+requires-python = ">=3.12,<3.14"

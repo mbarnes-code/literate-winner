@@ -1,0 +1,3 @@
+[tools]
+python = "3.12"
+# rust = "stable"  # uncomment for the sandbox-linux crate
