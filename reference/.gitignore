@@ -1,0 +1,9 @@
+# Ignore cloned reference repositories (populated by setup.sh)
+visa-vulnerability-agentic-harness/
+open-swe/
+deepagents/
+autoresearch/
+hermes-agent/
+bedrock-engineer/
+codex/
+goose/
