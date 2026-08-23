@@ -1,0 +1,1720 @@
+# Goose Repository Analysis: Agentic Harness Architecture
+
+Comprehensive deep-dive into Block's Goose (AAIF fork), one of 8 agent orchestration frameworks. All findings cite concrete file paths and line numbers.
+
+---
+
+## 1. Project Identity & Purpose
+
+**What is Goose?** 
+Goose is an open-source, general-purpose AI agent that runs natively on macOS, Linux, and Windows. It's a complete desktop/CLI/API agent framework designed for code, workflows, research, writing, automation, and data analysis.
+
+**Problem Domain:**
+- Local-first AI agent execution (not cloud-locked)
+- Framework for composable agent workflows (recipes)
+- Extension ecosystem via Model Context Protocol
+- Multiple LLM provider support with unified interface
+- Human-in-the-loop decision making with permission model
+
+**Source:** [README.md](reference/goose/README.md#L1-L30) — "your native open source AI agent — desktop app, CLI, and API"
+
+---
+
+## 2. Languages & Runtime
+
+### Language Split
+- **Rust**: ~95% of core logic (crate structure below)
+- **TypeScript**: Electron desktop UI (`ui/desktop/`)
+- **Python**: Some evaluation/setup scripts (minor)
+
+### Build System
+- **Primary:** Cargo workspace (Rust 1.94.1+, MSRV checked)
+- **Package Manager (UI):** pnpm v10.30.0+ with workspace
+- **Binary Distribution:** Cross-compiled binaries for macOS/Linux/Windows, Docker image
+
+**Workspace Definition:** [Cargo.toml](reference/goose/Cargo.toml#L1-L10)
+```toml
+[workspace]
+members = ["crates/*", "vendor/v8"]
+resolver = "2"
+```
+
+**Edition:** 2021, Version 1.47.0
+
+---
+
+## 3. Dependencies
+
+### Key Cargo Workspace Dependencies
+From [Cargo.toml#L13-L130](reference/goose/Cargo.toml#L13-L130):
+
+**MCP & Protocol:**
+- `rmcp = "3.0.0"` (Rust MCP reference implementation, heavy feature set)
+- `agent-client-protocol = "2.0.0"` (ACP spec compliance)
+- `agent-client-protocol-http = "2.0.0"` (ACP over HTTP)
+
+**LLM Integrations & Streaming:**
+- `reqwest = "0.13.2"` (HTTP client, multipart/form support)
+- `tokio-stream = "0.1.16"` (async streaming)
+- `tokio-util = "0.7.12"` (stream adapters)
+
+**Tool/Execution:**
+- `tree-sitter = "0.26"` (9 languages: Go, Java, JS, Kotlin, Python, Ruby, Rust, Swift, TS)
+- `process-wrap = "9"` (subprocess management with sessions)
+- `shell-words = "1"` (shell parsing)
+
+**Observability & Telemetry:**
+- `opentelemetry = "0.32"` (OTel tracing)
+- `opentelemetry-otlp = "0.32"` (OTLP export to vendor)
+- `tracing = "0.1.43"` (structured logging)
+- `tracing-subscriber = "0.3.22"` (filtering, formatting)
+- `langfuse` (via custom integration in [tracing/langfuse_layer.rs](reference/goose/crates/goose/src/tracing/langfuse_layer.rs))
+
+**Context & Model:**
+- `minijinja = "2.18"` (Jinja2 templates for prompts)
+- `jsonschema = "0.49"` (JSON Schema validation for structured outputs)
+- `schemars = "1.0.2"` (schema derivation)
+
+**Database & Persistence:**
+- `sqlx = "0.9.0"` (async SQLite with compile-time query checking)
+- `chrono = "0.4.44"` (timestamps, serialization)
+- `uuid = "1.23"` (session IDs, v4/v7)
+
+**AI-Specific (Optional Features):**
+- `candle-core = "0.11"` (local inference, Hugging Face, optional)
+- `candle-nn = "0.11"` (for Whisper/local models)
+- `llama-cpp-2 = "0.1.146"` (llama.cpp binding, pinned exact)
+- `tiktoken-rs = "0.12"` (OpenAI token counting)
+
+**AWS/Cloud (Optional):**
+- `aws-config`, `aws-sdk-bedrockruntime`, `aws-sdk-sagemakerruntime` (behind `aws-providers` feature)
+
+**Security & Crypto:**
+- `rustls = "0.23.31"` (TLS, aws_lc_rs backend)
+- `jsonwebtoken = "11.0"` (JWT for GCP auth)
+- `keyring = "3.6.3"` (system credential storage, vendored)
+- `sha2 = "0.11"` (hashing)
+
+**Crypto Libraries (Conditional):**
+- `aws-lc-rs` (rustls-tls path)
+- `openssl` (native-tls path)
+- `rcgen` (certificate generation)
+
+### Goose Main Crate Dependencies
+From [goose/Cargo.toml#L60-L180](reference/goose/crates/goose/Cargo.toml#L60-L180):
+
+- `axum = "0.8"` (HTTP framework for API layer)
+- `axum-server = "0.8"` (optional TLS server)
+- `tower-http = "0.7.0"` (CORS, middleware)
+- `sqlx` (SQLite persistence)
+- `tokio` (async runtime, multi-threaded)
+- `minijinja` (template engine for system prompts)
+- `serde_json` + `serde_yaml` (config serialization)
+
+### goose-mcp Crate Dependencies
+From [goose-mcp/Cargo.toml#L11-L27](reference/goose/crates/goose-mcp/Cargo.toml#L11-L27):
+
+- `rmcp` (MCP server, client, transport-io)
+- `lopdf = "0.44"` (PDF processing for MCP server)
+- `docx-rs = "0.4.18"` (Word doc extraction)
+- `image = "0.24.4"` (multi-format image parsing for autovisualiser)
+- `umya-spreadsheet = "3"` (Excel/spreadsheet extraction)
+
+### goose-providers Crate Dependencies
+From [goose-providers/Cargo.toml#L18-L52](reference/goose/crates/goose-providers/Cargo.toml#L18-L52):
+
+- `rmcp` (MCP server feature)
+- `reqwest` (HTTP for provider APIs)
+- `tokio-stream` (streaming responses)
+- `async-stream` (try_stream macro)
+- Optional: `goose-local-inference` (local models via candle)
+
+---
+
+## 4. Top-Level Directory Layout
+
+```
+/workspaces/literate-winner/reference/goose/
+├── crates/                           # Rust workspace members
+│   ├── goose/                        # Core agent logic (15K+ LOC)
+│   ├── goose-agent/                  # State machine engine (abstracted from goose)
+│   ├── goose-cli/                    # CLI entry point
+│   ├── goose-mcp/                    # Built-in MCP servers (4 servers)
+│   ├── goose-providers/              # LLM provider abstraction (15+ providers)
+│   ├── goose-provider-types/         # Shared provider interfaces
+│   ├── goose-context-management/     # Context compaction, token counting
+│   ├── goose-download-manager/       # Model/extension downloads
+│   ├── goose-local-inference/        # Local LLM (candle-based)
+│   ├── goose-sdk/                    # SDK for embedding goose
+│   ├── goose-sdk-types/              # ACP SDK types
+│   ├── goose-acp-macros/             # Procedural macros for ACP
+│   ├── goose-test/                   # Integration tests
+│   └── goose-test-support/           # Test utilities
+├── ui/
+│   ├── desktop/                      # Electron app (TypeScript/React)
+│   ├── sdk/                          # TypeScript SDK package
+│   └── text/                         # CLI text UI
+├── services/                         # Kubernetes/deployment manifests
+├── crates-rs/                        # (Legacy? Not visible in list)
+├── evals/
+│   └── harbor/                       # Evaluation framework (goose-self-test.yaml)
+├── documentation/                    # User-facing docs
+├── examples/                         # Code examples
+├── recipe-scanner/                   # Recipe validation tooling
+├── oidc-proxy/                       # OAuth/OIDC proxy for ACP providers
+├── workflow_recipes/                 # Example recipes
+├── scripts/                          # Build/release scripts
+├── Dockerfile                        # Multi-stage build for CLI
+├── AGENTS.md                         # Contribution guidelines
+├── CLAUDE.md                         # Project conventions for AI assistants
+├── .goosehints                       # Development hints for the codebase
+├── Cargo.toml                        # Workspace definition
+├── rust-toolchain.toml               # Enforced Rust version
+└── Justfile                          # Task automation (build, test, release)
+```
+
+### Crate Organization Details
+
+**goose/ crate structure** ([src/](reference/goose/crates/goose/src)):
+- `agents/` — Agent orchestration, tool execution, extension management
+- `conversation/` — Message representation, history management
+- `session/` — Session storage, naming, export
+- `providers/` — 15+ LLM provider implementations
+- `config/` — Configuration system (YAML, keyring, env vars)
+- `permission/` — Tool approval, permission model
+- `security/` — Prompt injection detection, egress inspection
+- `execution/` — Session execution mode (interactive, background, sub-task)
+- `context_mgmt/` — Message compaction, context management
+- `prompts/` — Template storage (8 markdown templates)
+- `hooks/` — Lifecycle event hooks (Open Plugins spec)
+- `gateway/` — Telegram/messaging gateway, pairing
+- `recipe/` — Recipe validation, building, execution
+- `skills/` — SKILL.md discovery and MCP client
+- `otel/` — OpenTelemetry configuration
+
+---
+
+## 5. Agent Architecture
+
+### 5a. Main Agent Loop / Control Flow
+
+**Primary Entry Point:** [state_machine/session.rs](reference/goose/crates/goose/src/agents/state_machine/session.rs#L1-L70)
+
+The agent uses a **state machine pattern** replacing a legacy agent loop. Enabled via `GOOSE_STATE_MACHINE=1` environment variable.
+
+**State Machine Core** ([goose-agent/machine.rs](reference/goose/crates/goose-agent/src/machine.rs#L48-L180)):
+
+```rust
+pub struct StateMachine<'a, S, E = ConversationEffect> {
+    steps: Vec<Step<'a, S, E>>,
+    cancel: CancellationToken,
+}
+
+impl<'a, S, E> StateMachine<'a, S, E> {
+    pub async fn step(&self, session: &S, emit: &Emitter) -> Result<Option<StepResult<E>>>
+    pub async fn apply<R>(...) -> Result<()>
+    pub async fn run<R>(...) -> Result<S>
+}
+```
+
+**Step Execution Model:**
+1. **Step** = `Operation | Inference`
+2. Each step runs sequentially
+3. Returns `OperationResult::NotApplicable` or `OperationResult::Applied(StepResult)`
+4. Results applied via `EffectHandler::apply_effects()`
+5. Loop continues until `yield_to_client = true` or no applicable steps
+
+**Conceptual Flow:**
+```
+User Message (persisted to session)
+        ↓
+Load Session (conversation history)
+        ↓
+StateMachine::step()
+  ├─ EntryHookOperation         (pre-processing hooks)
+  ├─ RecipeOperation             (if recipe active, execute recipe step)
+  ├─ SkillOperation              (execute /skill commands)
+  ├─ SlashCommandOperation       (execute /commands)
+  ├─ SteerOperation              (steering queue from system)
+  ├─ ProjectOperation            (project-aware tools)
+  ├─ RetryOperation              (auto-retry logic)
+  ├─ InferenceRunner             (→ call LLM provider)
+  ├─ ToolExecutionOperation      (execute tool calls from LLM)
+  ├─ UnknownToolOperation        (handle unrecognized tools)
+  ├─ ToolApprovalOperation       (ask human before tool execution)
+  ├─ BangShellOperation          (! command in agent message)
+  ├─ ToolPairCompactionOperation (combine consecutive tool calls)
+  ├─ CompactionOperation         (context summarization)
+  ├─ MaxTurnsOperation           (enforce turn limit)
+  ├─ DoctorOperation             (diagnostic info)
+  ├─ ExitOnErrorOperation        (halt on error)
+  └─ StopHookOperation           (policy hooks, can block turn end)
+        ↓
+Apply Effects (message append, replace conversation, update meta)
+        ↓
+If yield_to_client: return to UI/CLI
+Else: loop back to StateMachine::step()
+```
+
+**Source:** [state_machine/mod.rs](reference/goose/crates/goose/src/agents/state_machine/mod.rs#L1-L40)
+
+### 5b. Architecture Style
+- **Single-agent**: One active agent per session, but can spawn sub-agents via task tool
+- **Hierarchical planner-executor**: Not explicit; recipes provide planning
+- **ReAct-inspired**: Tool calls → results → next reasoning loop
+- **Streaming first**: All provider calls support streaming
+
+### 5c. State Management
+
+**Session Representation** ([session_manager.rs](reference/goose/crates/goose/src/session/session_manager.rs)):
+
+```rust
+pub struct Session {
+    pub id: String,                           // UUID or timestamp-based
+    pub conversation: Option<Conversation>,
+    pub recipe: Option<Recipe>,
+    pub extension_data: ExtensionData,
+    pub insights: SessionInsights,
+    // ... metadata (name, created_at, updated_at)
+}
+```
+
+**Conversation Storage** (SQLite-backed, [session_manager.rs](reference/goose/crates/goose/src/session/session_manager.rs)):
+- Stored in `~/.local/share/goose/sessions/` (XDG base dirs)
+- Single SQLite DB per session
+- Messages stored as rows with JSON content
+- Supports incremental replay
+
+**Message Model** ([conversation/message.rs](reference/goose/crates/goose/src/conversation)):
+- `Message` with role (user/assistant/system), content blocks
+- Content blocks: Text, ToolRequest (call), ToolResult, Thinking, NotificationBlock
+- Metadata: visibility, inference metadata, token usage
+
+### 5d. Message/History Representation
+
+**Conversation Object** ([conversation/mod.rs](reference/goose/crates/goose/src/conversation)):
+```rust
+pub struct Conversation {
+    messages: Vec<Message>,
+    summary: Option<String>,  // If compacted
+    // Context window management
+}
+```
+
+**Message Content Blocks:**
+- `Text(String)` — plain text
+- `ToolRequest(ToolRequest)` — LLM → tool call
+- `ToolResult(ToolResult)` — tool output back to LLM
+- `Thinking(String)` / `RedactedThinking(String)` — model reasoning (Claude only)
+- `SystemNotification(...)` — agent/system messages to user
+
+**Compaction Strategy** ([context_mgmt/compact_messages.rs](reference/goose/crates/goose/src/context_mgmt)):
+- Triggered when context > DEFAULT_COMPACTION_THRESHOLD (8K tokens)
+- LLM summarizes conversation into `summary` field
+- Original messages can be dropped or marked hidden
+- Compaction is re-entrant; can happen mid-session
+
+---
+
+## 6. LLM Provider Abstraction
+
+### 6a. Supported Providers
+
+From [providers/mod.rs](reference/goose/crates/goose/src/providers/mod.rs#L1-L60) and [goose-providers/lib.rs](reference/goose/crates/goose-providers/src/lib.rs#L1-L30):
+
+**Implemented Providers (in goose-providers crate):**
+1. **Anthropic** — Claude models (4.5 to legacy 4.0) — [anthropic.rs](reference/goose/crates/goose-providers/src/anthropic.rs#L1-L60)
+2. **OpenAI** — GPT-4, o1, o3, etc. — [openai.rs](reference/goose/crates/goose-providers/src/openai.rs)
+3. **Google** — Gemini — [google.rs](reference/goose/crates/goose-providers/src/google.rs)
+4. **Ollama** — Local models — [ollama.rs](reference/goose/crates/goose-providers/src/ollama.rs)
+5. **OpenAI-compatible** — Any OpenAI API-compatible endpoint — [openai_compatible.rs](reference/goose/crates/goose-providers/src/openai_compatible.rs)
+6. **Databricks** — (v1 and v2 variants)
+7. **Azure Foundry**
+8. **Snowflake** (Cortex)
+9. **AWS Bedrock** — (optional, behind `aws-providers` feature)
+10. **AWS SageMaker TGI** — (optional, behind `aws-providers` feature)
+11. **Local Inference** — Whisper, llama.cpp, Candle — (optional, behind `local-inference` feature)
+12. **Groq** — (via OpenAI-compatible wrapper)
+13. **xAI** — (custom provider in goose)
+14. **OpenRouter** — (custom provider in goose)
+15. **HuggingFace** — (inference API)
+16. **LiteLLM** — (proxy passthrough)
+
+**Declarative Provider System** ([providers/declarative.rs](reference/goose/crates/goose-providers/src/declarative.rs)):
+- YAML config-driven providers
+- Key resolver pattern (supports env vars, secrets)
+- Base URL, auth, model mapping customization
+
+**Custom Providers in goose crate** ([providers/mod.rs](reference/goose/crates/goose/src/providers)):
+- `copilot_acp` — GitHub Copilot via ACP
+- `claude_acp` — Claude via ACP
+- `claude_code` — Claude Code via ACP
+- `chatgpt_codex` — ChatGPT Code Interpreter
+- `cursor_agent` — Cursor's agent API
+- `tetrate` — Tetrate Istio AI integration
+- `gemini_cli` — Google Gemini CLI auth
+- `xai_oauth` — xAI OAuth flow
+- `openrouter` — OpenRouter platform
+
+### 6b. Model Routing & Selection
+
+**Config-Based Routing** ([config/providers.rs](reference/goose/crates/goose/src/config/providers.rs)):
+```yaml
+# ~/.config/goose/config.yaml
+goose:
+  provider: "anthropic"      # or "openai", "google", etc.
+  model: "claude-sonnet-4-5"
+```
+
+**Per-Session Model Override:**
+- Recipe can specify `settings.goose_provider` / `settings.goose_model`
+- Session can override active provider
+
+**Model Listing & Defaults:**
+- Each provider implements `Provider` trait with `list_models()` (see [base.rs](reference/goose/crates/goose-providers/src/base.rs))
+- Anthropic default: `claude-sonnet-4-5`; fast fallback: `claude-haiku-4-5`
+
+### 6c. Streaming Support
+
+**Streaming Implementation:**
+- All providers support streaming via `Provider::create_streaming_request()`
+- Returns `impl Stream<Item = Result<StreamingMessage, ProviderError>>`
+- Backend: `tokio_stream` with `AsyncBufRead` adapters
+- SSE (Server-Sent Events) for HTTP consumers
+
+**Caching & Prompt Caching:**
+- Anthropic: Supports token-level caching (transparent in request)
+- OpenAI: Supports caching headers
+- Others: Basic streaming only
+
+**Token Counting:**
+- `tiktoken-rs` for OpenAI (gpt-3.5, gpt-4)
+- Provider-specific counting for Anthropic (estimated)
+- Used for context management & compaction triggers
+
+### 6d. Provider Trait
+
+Core abstraction in [goose-providers/base.rs](reference/goose/crates/goose-providers/src/base.rs):
+
+```rust
+pub trait Provider: Send + Sync {
+    fn get_name(&self) -> &str;
+    
+    async fn create_streaming_request(
+        &self,
+        config: &ModelConfig,
+        conversation: &Conversation,
+        emit: &Emitter,
+    ) -> Result<impl Stream<Item = Result<StreamingMessage, ProviderError>>>;
+    
+    async fn list_models(&self) -> Result<Vec<ModelInfo>>;
+    
+    fn get_thinking_effort_support(&self) -> ThinkingEffortSupport;
+    
+    fn supports_vision(&self) -> bool;
+    
+    fn supports_streaming(&self) -> bool;
+    
+    fn default_permission_routing(&self) -> PermissionRouting;
+}
+```
+
+---
+
+## 7. Tool System
+
+### 7a. MCP-First Architecture
+
+Goose is **MCP-centric**: All external tools are Model Context Protocol servers.
+
+**MCP Protocol Version:** `ProtocolVersion::V_2025_11_25` ([agent.rs line 98](reference/goose/crates/goose/src/agents/agent.rs#L98))
+
+**MCP Client Implementation** ([mcp_client.rs](reference/goose/crates/goose/src/agents/mcp_client.rs#L1-L100)):
+- Uses `rmcp` crate (Rust MCP reference implementation v3.0.0)
+- Implements `McpClientTrait` with methods:
+  - `list_tools()` — fetch tool schemas
+  - `call_tool()` — execute tool with arguments
+  - `read_resource()` — access MCP resources (prompts, docs)
+  - `get_prompt()` — dynamic prompt extraction
+- Supports streaming tool results
+- Connection pooling & client reuse per extension
+
+### 7b. Built-In MCP Servers
+
+From [builtin_extension.rs](reference/goose/crates/goose/src/builtin_extension.rs) and [goose-mcp/mcp_server_runner.rs](reference/goose/crates/goose-mcp/src/mcp_server_runner.rs):
+
+```rust
+pub static BUILTIN_EXTENSIONS: Lazy<HashMap<&'static str, SpawnServerFn>> = Lazy::new(|| {
+    HashMap::from([
+        builtin!(autovisualiser, AutoVisualiserRouter),
+        builtin!(computercontroller, ComputerControllerServer),
+        builtin!(memory, MemoryServer),
+        builtin!(tutorial, TutorialServer),
+    ])
+});
+```
+
+**1. AutoVisualiser** ([goose-mcp/autovisualiser/](reference/goose/crates/goose-mcp/src/autovisualiser)):
+- Extracts text/images from documents (PDF, DOCX, XLSX, images)
+- Uses `lopdf`, `docx-rs`, `umya-spreadsheet`, `image`
+- Tools:
+  - `read_pdf()` — extract PDF content
+  - `read_word()` — extract Word doc
+  - `read_spreadsheet()` — read Excel
+  - `view_image()` — OCR/analyze images
+
+**2. ComputerController** ([goose-mcp/computercontroller/](reference/goose/crates/goose-mcp/src/computercontroller)):
+- Takes screenshots, interacts with GUI (desktop automation)
+- Tools:
+  - `screenshot()` — capture screen
+  - `mouse_click()`, `mouse_move()` — cursor control
+  - `type_text()` — keyboard input
+  - `take_screenshot_with_annotations()` — highlight areas
+
+**3. Memory Server** ([goose-mcp/memory/](reference/goose/crates/goose-mcp/src/memory)):
+- Persistent memory/note-taking for agent
+- Tools:
+  - `create_memory()`, `read_memory()`, `update_memory()`, `delete_memory()`
+  - Search & recall
+
+**4. Tutorial Server** ([goose-mcp/tutorial/](reference/goose/crates/goose-mcp/src/tutorial)):
+- Interactive tutorials/onboarding
+- Tools:
+  - `start_tutorial()`, `get_tutorial_step()`, `complete_tutorial()`
+
+### 7c. Extension Manager & Tool Discovery
+
+**Extension Manager** ([agents/extension_manager.rs](reference/goose/crates/goose/src/agents/extension_manager.rs#L1-L80)):
+
+Handles:
+1. **Loading Extensions** (MCP servers)
+   - Built-in extensions (4 above)
+   - Installed extensions via package managers
+   - HTTP-based remote extensions
+   - Subprocess-spawned extensions (stdio transport)
+
+2. **Extension Configuration**
+   - `config.yaml` lists enabled extensions
+   - Per-extension env vars, timeouts, auth
+   - Secret substitution from keyring/file
+
+3. **Tool Schema Normalization**
+   - Fetches MCP `ListToolsResult`
+   - Converts to Goose `Tool` schema
+   - Infers tool categories (Shell, Read, Write, Other)
+
+**Extension Lifecycle:**
+```
+discover_enabled_extensions() 
+  → load configs from ~/.config/goose/config.yaml
+  → resolve secrets (keyring/env)
+  → spawn MCP subprocess or connect HTTP
+  → list_tools() on MCP server
+  → cache tool schemas
+  → create ExtensionManager
+```
+
+### 7d. Tool Execution & Dispatch
+
+**Tool Execution Flow** ([agents/tool_execution.rs](reference/goose/crates/goose/src/agents/tool_execution.rs)):
+
+```
+LLM Response (contains ToolRequest[])
+    ↓
+ToolExecutionOperation::run()
+  ├─ Categorize: Shell, Read, Write, Other
+  ├─ ToolApprovalOperation (human confirmation if needed)
+  │   └─ Ask: "Execute [tool]? y/n"
+  ├─ For each approved tool:
+  │   ├─ Call MCP server: callTool(name, args)
+  │   ├─ Stream result to agent
+  │   └─ Record ToolResult in conversation
+  └─ Return tool results
+    ↓
+Back to Inference (with results, loop continues)
+```
+
+**Tool Result Handling** ([agents/tool_execution.rs](reference/goose/crates/goose/src/agents/tool_execution.rs#L150-L250)):
+- Streaming responses: Large outputs chunked & buffered
+- Error handling: Tool timeout (default 60s, configurable)
+- Redaction: Sensitive output can be masked
+- Notification: Real-time tool execution events to UI
+
+### 7e. Tool Approval & Permission Model
+
+**Permission System** ([permission/mod.rs](reference/goose/crates/goose/src/permission)):
+
+Three-layer permission check:
+1. **PermissionInspector** — Rule-based (e.g., shell always needs approval in interactive mode)
+2. **PermissionJudge** — LLM-based (asks: "Is this tool call intentional?" using permission_judge.md prompt)
+3. **Manual Confirmation** — If both above suggest approval, ask user
+
+**Built-in Approval Triggers:**
+- Shell execution (developer__shell)
+- File writes to sensitive paths
+- Network access
+- Configurable via `~/.config/goose/permission.yaml`
+
+**Source:** [permission_judge.rs](reference/goose/crates/goose/src/permission/permission_judge.rs)
+
+### 7f. Extensions Concept
+
+**Extensions** are MCP servers with:
+1. **Configuration Block** (in config.yaml):
+   ```yaml
+   extensions:
+     - name: "my_extension"
+       required: false
+       timeout: 60
+       env:
+         PARAM: "value"
+   ```
+
+2. **Discovery & Installation:**
+   - Local directory: `~/.config/goose/extensions/`
+   - Package managers: apt, brew, pip, npm (via `goose extension install`)
+   - HTTP remote: via URL
+
+3. **MCP Server Spec:**
+   - Stdio-based by default (child process, JSON-RPC over stdin/stdout)
+   - HTTP transport supported
+   - Unix socket transport supported
+
+4. **Tool Naming Convention:**
+   - `extension_name__tool_name`
+   - Example: `developer__shell`, `autovisualiser__read_pdf`
+
+5. **Enable/Disable:**
+   - Toggled via config or CLI: `goose extension enable/disable NAME`
+   - Per-session override in recipe
+
+**Source:** [config/extensions.rs](reference/goose/crates/goose/src/config/extensions.rs)
+
+---
+
+## 8. Prompt / System Message Strategy
+
+### 8a. Prompt Storage & Templates
+
+**Builtin Prompts Directory:**
+Stored as embedded markdown in [src/prompts/](reference/goose/crates/goose/src/prompts):
+- `system.md` — Main system prompt (defines personality, behavior)
+- `compaction.md` — Summarization prompt
+- `subagent_system.md` — Sub-agent instructions
+- `recipe.md` — Recipe generation prompt
+- `apps_create.md`, `apps_iterate.md` — Goose app creation
+- `permission_judge.md` — Permission analysis
+- `plan.md` — Step-by-step planning
+- `tiny_model_system.md` — Shell-based local model emulation
+- `session_name.md` — Auto-generate session names
+
+**Template System** ([prompt_template.rs](reference/goose/crates/goose/src/prompt_template.rs#L1-L80)):
+
+```rust
+pub fn render_template<T: Serialize>(name: &str, context: &T) -> Result<String, MiniJinjaError> {
+    // 1. Check user override: ~/.config/goose/prompts/{name}
+    // 2. Fall back to builtin_content(name)
+    // 3. Render with minijinja (Jinja2-compatible)
+}
+```
+
+**Jinja2 Features Used:**
+- Variable substitution `{{ var }}`
+- Filters (custom: `code_fence` for markdown fence handling)
+- Conditionals `{% if condition %}`
+- Loops (not heavily used)
+- Template inheritance (not used)
+
+### 8b. Main System Prompt
+
+**Source:** [system.md](reference/goose/crates/goose/src/prompts/system.md)
+
+**Key Sections (inferred from prompt_manager.rs):**
+1. **Identity & Capabilities**: "You are Goose, an AI agent..."
+2. **Extension Listing**: Dynamic list of enabled extensions with descriptions
+3. **Mode Declaration**: Autonomous vs interactive, subagent vs main agent
+4. **Tool Usage**: "You have access to these tools via MCP..."
+5. **Constraints**: Permission model, approval requirements
+6. **Behavior Guidance**: Prefer local execution, respect user privacy, etc.
+
+**Dynamic Content Injection** ([agents/prompt_manager.rs](reference/goose/crates/goose/src/agents/prompt_manager.rs#L1-L150)):
+
+```rust
+pub struct SystemPromptBuilder<'a, M> {
+    extensions_info: Vec<ExtensionInfo>,
+    frontend_instructions: Option<String>,
+    prompt_extras: IndexMap<String, String>,
+    subagents_enabled: bool,
+    hints: Option<String>,    // From .goosehints files
+    code_execution_mode: bool,
+    include_extensions: bool,
+    goose_mode: Option<GooseMode>,
+}
+```
+
+**Template Context Variables:**
+- `extensions[]` — Enabled tools with descriptions
+- `current_date_time` — Timestamp
+- `goose_mode` — ("interactive", "autonomous", "subagent")
+- `is_autonomous` — Boolean flag
+- `enable_subagents` — Whether task tool is available
+- `code_execution_mode` — Code interpreter enabled
+- `moim_system_prompt_block` — Multimodal (vision) instructions (optional)
+
+### 8c. .goosehints Convention
+
+**Purpose:** Project-specific context hints loaded into system prompt
+
+**Location:** `~project/.goosehints`
+
+**Example** ([.goosehints](reference/goose/.goosehints)):
+```
+This is a rust project with crates in the crates dir:
+goose: the main code for goose, contains all the core logic
+goose-bench: bench marking
+goose-cli: the command line interface, use goose crate
+...
+tips: 
+- can look at unstaged changes for what is being worked on if starting
+- always check rust compiles, cargo fmt etc
+```
+
+**Mechanism** ([hints/mod.rs](reference/goose/crates/goose/src/hints)):
+- Discovered via `.gitignore` walk (respects .gitignore patterns)
+- Loaded into `hints` variable in system prompt context
+- Rendered into system message as "Project Context: ..."
+
+---
+
+## 9. Memory & Context Management
+
+### 9a. Session Storage
+
+**Storage Backend:** SQLite (per-session database)
+
+**Location:** `~/.local/share/goose/sessions/{session_id}.db`
+
+**Schema:**
+- `messages` table (rows for each message)
+- `metadata` table (session name, created_at, recipe)
+- `extensions` table (enabled extensions state)
+
+**Implementation** ([session/session_manager.rs](reference/goose/crates/goose/src/session/session_manager.rs)):
+
+```rust
+pub struct SessionManager {
+    // Loads and persists sessions to SQLite
+    // Implements SessionLoader & EffectHandler for state machine
+}
+
+pub async fn add_message(&self, session_id: &str, message: &Message) -> Result<()>
+pub async fn replace_conversation(&self, session_id: &str, conversation: &Conversation) -> Result<()>
+pub async fn update(&self, session_id: &str) -> SessionUpdateBuilder
+```
+
+**Session Lifetime:**
+1. Create: `SessionManager::create_session()` (ID is UUID or timestamp)
+2. Load: `SessionManager::get_session(id, include_conversation)` (lazy conversation load)
+3. Append messages: `add_message()` per turn
+4. Rename: `SessionManager::rename_session()`
+5. Delete: `SessionManager::delete_session()`
+6. Export: `SessionManager::export_session_to_markdown()`
+
+### 9b. Summarization / Compaction
+
+**Context Management Crate:** [goose-context-management/](reference/goose/crates/goose-context-management)
+
+**Trigger Condition:**
+```rust
+if message_count > DEFAULT_COMPACTION_THRESHOLD  // ~8K tokens
+   && turn_count > 10
+   && !recent_turn {
+    initiate_compaction()
+}
+```
+
+**Compaction Process** ([context_mgmt/compact_messages.rs](reference/goose/crates/goose/src/context_mgmt)):
+
+1. **Trigger**: Context window nearing limit
+2. **Call LLM** with `compaction.md` prompt + full conversation
+3. **LLM Summarizes** → structured JSON with key facts
+4. **Store** summary in Conversation object
+5. **Drop/Hide** original messages or reconstruct with summary
+6. **Resume**: Continue agent loop with compacted context
+
+**Token Counting** ([token_counter.rs](reference/goose/crates/goose/src/token_counter.rs)):
+- Anthropic: Estimated via character count
+- OpenAI: Precise via `tiktoken-rs`
+- Fallback: Conservative character-based estimate
+
+### 9c. Message Visibility & Metadata
+
+**Message Visibility Flags:**
+```rust
+pub struct Message {
+    pub user_visible: bool,      // Show in UI
+    pub agent_visible: bool,     // Include in LLM context
+    pub role: Role,              // user, assistant, system
+    pub content: Vec<MessageContent>,
+    pub metadata: MessageMetadata,
+}
+```
+
+**Metadata:**
+- `inference_metadata`: Model name, tokens used, latency
+- `tool_call_labels`: Which tools were called, approval status
+- `timestamp`: When message was created
+- `session_id`: Reference to parent session
+
+---
+
+## 10. Planning Subsystem
+
+### Recipe System
+
+**Definition** ([recipe/mod.rs](reference/goose/crates/goose/src/recipe)):
+
+A recipe is a YAML/JSON file that defines a multi-turn workflow or task template.
+
+**Recipe Schema** ([recipe/mod.rs#L20-L100](reference/goose/crates/goose/src/recipe/mod.rs#L20-L100)):
+
+```yaml
+version: "1.0.0"
+title: "Code Review"
+description: "Review a pull request"
+
+instructions: |
+  You are a code reviewer. Review the PR...
+
+prompt: "Please review this PR..."
+
+extensions:
+  - name: "developer"
+    required: true
+
+settings:
+  goose_provider: "anthropic"
+  goose_model: "claude-sonnet-4-5"
+  temperature: 0.7
+  max_turns: 20
+
+parameters:
+  - name: "pr_url"
+    type: "string"
+    description: "Pull request URL"
+
+response:
+  json_schema:
+    type: "object"
+    properties:
+      issues: { type: "array" }
+      suggestions: { type: "array" }
+
+retry:
+  max_retries: 3
+  timeout_seconds: 300
+
+sub_recipes:
+  - name: "lint_check"
+    path: "recipes/lint.yaml"
+    sequential_when_repeated: true
+```
+
+**Key Fields:**
+- `instructions` or `prompt` (required): Initial context
+- `extensions`: Required/optional MCP servers
+- `settings`: Override provider, model, temperature
+- `parameters`: Templated inputs
+- `response`: JSON schema for structured output (Claude API native)
+- `retry`: Auto-retry config
+- `sub_recipes`: Nested recipes
+
+### Recipe Execution Flow
+
+**Entry Point:** [state_machine/ops_recipe.rs](reference/goose/crates/goose/src/agents/state_machine/ops_recipe.rs)
+
+1. **RecipeOperation::run()**
+   - Check if session has active recipe
+   - If no recipe: NotApplicable
+   - If recipe active: Get next step
+
+2. **Step Execution**
+   - For each sub-recipe in sequence
+   - Call sub-recipe as separate agent session (if sequential)
+   - Or execute in parallel (configurable)
+
+3. **State Tracking**
+   - `ExtensionData::recipe_state` tracks progress
+   - Persisted in session.extension_data
+
+4. **Completion**
+   - Recipe completes when all sub-recipes done
+   - Triggers response schema validation
+   - Emits `RecipeComplete` event
+
+### Recipe Registration
+
+**Discovery Paths:**
+- `~/.local/share/goose/recipes/` (user recipes)
+- `${GOOSE_RECIPE_DIR}/` (env-configured)
+- GitHub repository (via `goose recipe list --remote`)
+- Built-in recipes in crate (embedded)
+
+**CLI Commands:**
+```bash
+goose recipe list              # List available recipes
+goose recipe open <name>       # Launch recipe (opens in Desktop/CLI)
+goose recipe validate <path>   # Validate recipe YAML
+goose run --recipe <name>      # Start session with recipe
+```
+
+**Source:** [cli.rs commands/recipe.rs](reference/goose/crates/goose-cli/src/commands/recipe.rs#L1-L100)
+
+---
+
+## 11. Sub-Agents / Delegation
+
+### Task Tool & Subagent Execution
+
+**Concept:** Goose can spawn child sessions to handle subtasks.
+
+**Implementation** ([agents/subagent_execution_tool/mod.rs](reference/goose/crates/goose/src/agents/subagent_execution_tool/mod.rs#L1-L80)):
+
+```rust
+pub async fn execute_subagent_task(
+    task: String,
+    instructions: Option<String>,
+    config: SubagentTaskConfig,
+) -> Result<String> {
+    // 1. Create child session with SessionExecutionMode::SubTask { parent: session_id }
+    // 2. Inject task as initial prompt
+    // 3. Run agent loop until completion
+    // 4. Return task result to parent
+}
+```
+
+**Task Tool Schema:**
+```json
+{
+  "name": "task",
+  "description": "Create a subagent to handle a specific task",
+  "input_schema": {
+    "properties": {
+      "task": { "type": "string" },
+      "instructions": { "type": "string" }
+    },
+    "required": ["task"]
+  }
+}
+```
+
+**Subagent Prompt** ([prompts/subagent_system.md](reference/goose/crates/goose/src/prompts/subagent_system.md)):
+- Distinct from main agent
+- Includes task context
+- Can use same or different extensions
+
+**Limitations:**
+- No deep hierarchies (depth = 2: main → subagent)
+- No explicit agent-to-agent communication (only task result return)
+- No shared memory between siblings
+
+**Source:** [agents/subagent_handler.rs](reference/goose/crates/goose/src/agents/subagent_handler.rs)
+
+---
+
+## 12. Human-in-the-Loop
+
+### Approval Prompts
+
+**Three Approval Stages:**
+
+1. **Pre-Tool Execution** ([ToolApprovalOperation](reference/goose/crates/goose/src/agents/state_machine/ops_tool_approval.rs)):
+   - Triggered for dangerous operations (shell, file write)
+   - Prompt: "Execute [tool] with args? y/n"
+   - User input: TUI prompt or frontend modal
+
+2. **Permission Judge** ([permission_judge.rs](reference/goose/crates/goose/src/permission/permission_judge.rs)):
+   - LLM analyzes tool call intent
+   - Prompt: "Is this tool use intentional?" (using permission_judge.md)
+   - LLM decides: Approved / Needs Confirmation / Denied
+
+3. **Action Required Manager** ([action_required_manager.rs](reference/goose/crates/goose/src/action_required_manager.rs)):
+   - Streams action-required messages to UI
+   - User confirms via "elicitation" mechanism
+   - Waits for response before continuing
+
+### Confirm-Before-Execute
+
+**Flow in ToolExecutionOperation** ([ops_toolcalling.rs](reference/goose/crates/goose/src/agents/state_machine/ops_toolcalling.rs)):
+
+```
+LLM returns tool calls
+  ↓
+For each tool call:
+  ├─ Categorize (Shell / Write / Read / Other)
+  ├─ If dangerous (Shell or Write):
+  │   ├─ Call PermissionJudge (LLM analysis)
+  │   ├─ If needs confirmation:
+  │   │   └─ Emit ActionRequired event
+  │   │   └─ Wait for user elicitation response
+  │   └─ If approved:
+  │       └─ Execute tool via MCP
+  └─ Record result
+```
+
+### Elicitation / Action Required
+
+**UI Mechanism** ([action_required_manager.rs](reference/goose/crates/goose/src/action_required_manager.rs)):
+
+```rust
+pub struct ElicitationOutcome {
+    pub action: ElicitationAction,  // Approve / Deny / etc.
+    pub reason: Option<String>,
+    pub timestamp: DateTime<Utc>,
+}
+```
+
+**Electron Desktop UI:**
+- Shows modal: "Goose wants to execute shell: `rm -rf ...`"
+- Buttons: Approve, Deny, Approve All
+- User choice persisted or per-session
+
+**CLI TUI:**
+- Text prompt with y/n/a options
+- Respects GOOSE_APPROVAL_ALWAYS_DENY env var (testing)
+
+---
+
+## 13. Sandboxing / Safety
+
+### 13a. Security Components
+
+**Security Manager** ([security/mod.rs](reference/goose/crates/goose/src/security)):
+
+Three independent inspectors:
+
+1. **PromptInjectionScanner** ([security/scanner.rs](reference/goose/crates/goose/src/security/scanner.rs)):
+   - Detects prompt injection in user input
+   - LLM-based classification (optional, behind feature flag)
+   - Pattern-based regex fallback
+   - Enabled via `SECURITY_PROMPT_ENABLED` config
+
+2. **AdversaryInspector** ([security/adversary_inspector.rs](reference/goose/crates/goose/src/security/adversary_inspector.rs)):
+   - Analyzes tool calls for malicious intent
+   - Detects data exfiltration patterns
+   - Checks for privilege escalation
+
+3. **EgressInspector** ([security/egress_inspector.rs](reference/goose/crates/goose/src/security/egress_inspector.rs)):
+   - Network egress control
+   - Blocks outbound connections to blacklisted domains
+   - Enforces corporate network policies
+
+**SecurityResult:**
+```rust
+pub struct SecurityResult {
+    pub is_malicious: bool,
+    pub confidence: f32,
+    pub explanation: String,
+    pub should_ask_user: bool,
+    pub finding_id: String,
+}
+```
+
+### 13b. Tool Inspection & Repetition Detection
+
+**Tool Monitor** ([tool_monitor.rs](reference/goose/crates/goose/src/tool_monitor.rs)):
+
+- **RepetitionInspector**: Detects if agent is looping on same tool
+  - Tracks last N tool calls
+  - Alerts if > threshold repeats of same tool
+  - Triggers auto-retry or user notification
+
+**Tool Call Labels** ([tool_call_labels.rs](reference/goose/crates/goose/src/tool_call_labels.rs)):
+- Annotate tool calls with approval status
+- Track execution time, error rate
+- Audit trail for security review
+
+### 13c. Extension Validation
+
+**Malware Check** ([agents/extension_malware_check.rs](reference/goose/crates/goose/src/agents/extension_malware_check.rs)):
+
+- Scans downloaded MCP servers for known malware signatures
+- Uses `clamav` or fallback pattern matching
+- Prompts user before enabling untrusted extension
+
+**Process Sandboxing:**
+- MCP servers spawned as child processes with limited privileges
+- Stdio-only communication (no arbitrary IPC)
+- Timeout enforcement (default 60s per tool call)
+- Memory limits via OS process controls
+
+---
+
+## 14. Observability
+
+### 14a. OpenTelemetry Integration
+
+**OTel Configuration** ([otel/mod.rs](reference/goose/crates/goose/src/otel/mod.rs)):
+
+```rust
+#[cfg(feature = "otel")]
+pub mod otel;
+
+// Provides:
+// - Tracing: Structured logging with spans
+// - Metrics: Request count, latency, token usage
+// - Logs: Event logs with context
+```
+
+**Tracing Setup** ([tracing/mod.rs](reference/goose/crates/goose/src/tracing/mod.rs)):
+
+**Three Layers:**
+
+1. **OpenTelemetry Layer** ([tracing/observation_layer.rs](reference/goose/crates/goose/src/tracing/observation_layer.rs)):
+   - Converts tracing spans to OTel Span
+   - Records events as OTel Events
+   - Configured via OTEL_EXPORTER_OTLP_ENDPOINT
+
+2. **Langfuse Layer** ([tracing/langfuse_layer.rs](reference/goose/crates/goose/src/tracing/langfuse_layer.rs)):
+   - Direct integration with Langfuse (LLM observability)
+   - Batched reporting
+   - Token usage tracking, latency, provider info
+
+3. **Rate Limiter** ([tracing/rate_limiter.rs](reference/goose/crates/goose/src/tracing/rate_limiter.rs)):
+   - Throttles telemetry sends
+   - Prevents overwhelming observability backend
+   - Configurable batch size
+
+### 14b. Instrumentation
+
+**Key Spans:**
+
+From [agents/state_machine/ops_llm.rs](reference/goose/crates/goose/src/agents/state_machine/ops_llm.rs#L85-L110):
+
+```rust
+let span = tracing::info_span!(
+    target: "goose::state_machine",
+    "chat",
+    "gen_ai.operation.name" = "chat",
+    "gen_ai.provider.name" = %provider.get_name(),
+    "gen_ai.request.model" = %model_config.model_name,
+    "gen_ai.response.finish_reasons" = tracing::field::Empty,
+    "gen_ai.usage.input_tokens" = tracing::field::Empty,
+    "gen_ai.usage.output_tokens" = tracing::field::Empty,
+    session.id = %session_id,
+);
+```
+
+**Metrics Tracked:**
+- LLM request latency (provider, model, session)
+- Token usage (input, output, total per session)
+- Tool execution time (per tool, per session)
+- Context compaction events
+- Agent turn count
+- User confirmation delays
+
+### 14c. Logging Configuration
+
+**Structured Logging** ([logging.rs](reference/goose/crates/goose/src/logging.rs)):
+
+- JSON output format (for log aggregation)
+- Configurable per-module levels
+- Environment variable control: `RUST_LOG=goose::agents=debug`
+- File logging to `~/.local/share/goose/logs/`
+
+**Telemetry Opt-In** ([posthog.rs](reference/goose/crates/goose/src/posthog.rs)):
+- Optional PostHog integration
+- Tracks feature usage, errors (behind `telemetry` feature)
+- User consent dialog on first run
+
+---
+
+## 15. Evaluation / Testing
+
+### Evaluation Framework
+
+**goose-self-test.yaml** ([goose-self-test.yaml](reference/goose/goose-self-test.yaml)):
+
+Built-in recipe for testing agent capabilities:
+
+```yaml
+title: "Goose Self-Test"
+description: "Validate goose functionality"
+instructions: |
+  Please run the following tests...
+  
+extensions:
+  - name: "developer"
+    required: true
+
+settings:
+  max_turns: 50
+
+sub_recipes:
+  - name: "test_shell"
+    path: "evals/shell_test.yaml"
+  - name: "test_file_ops"
+    path: "evals/file_ops_test.yaml"
+  - name: "test_reasoning"
+    path: "evals/reasoning_test.yaml"
+```
+
+**Execution:**
+```bash
+goose run --recipe goose-self-test.yaml
+```
+
+### Testing Infrastructure
+
+**Unit Tests** ([crates/goose/tests/](reference/goose/crates/goose/tests)):
+- Provider mock tests
+- Message serialization
+- Session persistence
+- Configuration loading
+
+**Integration Tests** ([crates/goose/tests/](reference/goose/crates/goose/tests)):
+- End-to-end agent loop (real LLM)
+- MCP extension loading
+- Tool execution with approval flows
+
+**Test Utilities** ([goose-test-support/](reference/goose/crates/goose-test-support)):
+- Mock providers
+- Test session builder
+- Fixture recipes
+
+**CLI:**
+```bash
+cargo test -p goose                    # All goose tests
+cargo test --package goose --test mcp_integration_test
+just record-mcp-tests                  # Record MCP snapshots
+```
+
+---
+
+## 16. Configuration
+
+### Configuration File
+
+**Location:** `~/.config/goose/config.yaml`
+
+**Schema** (from [config/base.rs](reference/goose/crates/goose/src/config/base.rs)):
+
+```yaml
+# Provider & Model Selection
+goose:
+  provider: "anthropic"        # or "openai", "google", etc.
+  model: "claude-sonnet-4-5"
+  thinking_effort: "medium"    # (Claude only)
+
+# Session Defaults
+session:
+  default_extensions:
+    - "developer"
+    - "autovisualiser"
+  max_turns: 1000
+  auto_name: true              # Auto-generate session names
+
+# Security & Permissions
+security:
+  prompt_injection_detection_enabled: false
+  command_classifier_enabled: false
+
+# Extensions Configuration
+extensions:
+  developer:
+    enabled: true
+    timeout: 60
+    env:
+      PARAM: "value"
+
+# Observability
+telemetry:
+  enabled: false
+  posthog_enabled: false
+  langfuse_api_key: "pk-..."
+
+# Advanced
+experiments:
+  state_machine: false         # Use new state machine (GOOSE_STATE_MACHINE=1)
+```
+
+### Secret Management
+
+**Two-Tier Secret Storage:**
+
+1. **System Keyring** (preferred):
+   - Stored in OS credential store (Keychain macOS, credential-manager Windows, secret-service Linux)
+   - Fallback to file if keyring unavailable
+
+2. **File-Based** (fallback):
+   - `~/.config/goose/secrets.yaml`
+   - Encrypted with 0600 permissions
+   - Used if keyring disabled via `GOOSE_DISABLE_KEYRING`
+
+**Secret Keys:**
+- Provider API keys: `provider_openai_api_key`, `provider_anthropic_api_key`
+- OAuth tokens: Stored and refreshed automatically
+
+### Profiles & Multi-Provider Setup
+
+**Not Explicitly Supported:**
+- Single active provider at a time
+- Override via recipe `settings.goose_provider`
+- Or via CLI flag: `goose run --provider openai`
+
+---
+
+## 17. Entry Points
+
+### CLI Entry Point
+
+**Binary:** `goose` (built from [goose-cli/src/main.rs](reference/goose/crates/goose-cli/src/main.rs))
+
+**Command Structure** ([cli.rs](reference/goose/crates/goose-cli/src/cli.rs)):
+
+```bash
+goose [COMMAND] [OPTIONS]
+
+# Main Commands:
+goose session <COMMAND>         # Session management
+  goose session list            # List sessions
+  goose session remove          # Delete sessions
+
+goose run [OPTIONS]             # Start new or resume session
+  --name "my-session"           # Named session
+  --session-id "20250325_..."   # Resume specific session
+  --recipe "recipe.yaml"        # Load recipe
+  --provider "openai"           # Override provider
+
+goose recipe <COMMAND>          # Recipe management
+  goose recipe list             # List available recipes
+  goose recipe open <name>      # Open in Desktop
+  goose recipe validate <path>  # Validate YAML
+
+goose configure                 # Interactive setup wizard
+  
+goose doctor                    # Diagnostics & troubleshooting
+
+goose schedule <COMMAND>        # Scheduled session execution
+  goose schedule add <recipe>   # Schedule recurring task
+  goose schedule list           # View cron jobs
+  
+goose skill <COMMAND>           # Skill management (SKILL.md discovery)
+  goose skill list              # List available skills
+
+goose update                    # Check for updates
+
+goose acp <COMMAND>             # (Internal) ACP server
+
+goose mcp                       # MCP server mode (internal)
+
+# MCP Subcommands:
+goose mcp autovisualiser        # Start autovisualiser MCP server
+goose mcp computercontroller    # Start desktop automation server
+goose mcp memory                # Start memory server
+goose mcp tutorial              # Start tutorial server
+```
+
+### Desktop UI Entry Point
+
+**Electron App** ([ui/desktop/src/main.ts](reference/goose/ui/desktop/src/main.ts)):
+
+- Launches Goose window (macOS/Windows/Linux native)
+- Communicates with Rust backend via HTTP API (localhost:PORT)
+- Frontend: React + Radix UI
+- Session management via WebSocket (streaming)
+- Orchestrates provider auth (OAuth redirect)
+
+**Launch:**
+```bash
+cd ui/desktop && pnpm run start-gui
+```
+
+### HTTP API / Gateway
+
+**Server Component:** Built into `goose` binary (not separate crate)
+
+**Activation:** 
+- Started automatically when UI connects
+- Listens on `http://localhost:9876` (default)
+- Requires authentication token (generated per session)
+
+**Endpoints** (not fully enumerated, but includes):
+- `POST /api/session` — Create session
+- `WS /api/session/{id}/chat` — Streaming chat
+- `GET /api/session/{id}/conversation` — Fetch conversation
+- `POST /api/tool/execute` — Direct tool execution
+- `GET /api/provider/list` — List configured providers
+- `GET /api/extension/list` — List extensions
+
+**Authentication:**
+- Token-based (JWT or session key)
+- OAuth for external provider auth flows
+
+---
+
+## 18. Notable Idioms / Patterns
+
+### 1. State Machine Architecture
+- **Ordered operations** running sequentially
+- **Re-entrant loops**: Multiple turns within single `StateMachine::step()`
+- **Effect-based mutations**: Changes returned as `GooseEffect` enum
+- **Persistence layer**: Effects applied via `SessionManager` (EffectHandler trait)
+
+**Why This Pattern?**
+- Testability: Operations are composable, testable in isolation
+- Debuggability: Clear step-by-step execution trace
+- Extensibility: New operations added as new Step types
+
+### 2. MCP-First Extensions
+- **Zero built-in tools** (except shell/file via developer extension)
+- **All tools pluggable**: Even core tools (memory, vision) are MCP servers
+- **Uniform interface**: Tool discovery via MCP ListTools
+- **Extensible SDK**: Easy to create custom MCP servers in any language
+
+### 3. Recipe-Driven Workflows
+- **Declarative planning**: YAML templates for multi-turn flows
+- **Composable sub-recipes**: Recipes can include other recipes
+- **Parameterized inputs**: Template variables for reusability
+- **Structured outputs**: JSON schema validation of results
+
+### 4. Permission Model
+- **Three-layer approval**: Rules, LLM judge, user confirmation
+- **Granular tool categorization**: Shell vs Read vs Write
+- **Policy hooks**: Can block turn-end if conditions unmet
+- **Audit trail**: All approvals logged with metadata
+
+### 5. Prompt Engineering
+- **Embedded templates**: Jinja2 markdown files, compiled into binary
+- **User customization**: Override any prompt at `~/.config/goose/prompts/`
+- **Dynamic context injection**: Extensions, hints, mode flags injected at runtime
+- **Multimodal support**: Separate prompts for vision, code modes
+
+### 6. Session Persistence
+- **SQLite per-session**: Lightweight, embedded DB
+- **Lazy loading**: Conversation only loaded when needed
+- **Incremental append**: Messages added one-by-one (no full rewrite)
+- **Compaction support**: Conversation can be summarized in-place
+
+### 7. Provider Abstraction
+- **Trait-based polymorphism**: `Provider` trait covers all LLM backends
+- **Declarative config**: Many providers built from YAML templates
+- **Custom auth flows**: OAuth, API keys, client certs all supported
+- **Streaming-first API**: All responses streamed, batched results supported
+
+### 8. Context Management
+- **Automatic compaction**: Context window triggers summarization
+- **Token counting**: Multiple strategies (exact, estimated)
+- **Message visibility**: Can hide/show messages from UI or LLM
+- **Dual-visibility**: user_visible vs agent_visible (privacy)
+
+---
+
+## 19. Data Flow Diagram (User Message → Response)
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ User sends message in Desktop UI or CLI                         │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ Message persisted to Session (SQLite)                           │
+│ Conversation = [..., UserMessage]                               │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ StateMachine::step()                                            │
+│ Load Session from SessionManager                                │
+│ For each Operation in steps:                                    │
+│   - Check if applicable (e.g., no recipe → skip RecipeOp)      │
+│   - If Inference: call InferenceRunner                          │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ InferenceRunner::infer()                                        │
+│                                                                 │
+│ 1. Build system prompt:                                         │
+│    - Load system.md template                                    │
+│    - Inject enabled extensions info                             │
+│    - Add .goosehints context                                    │
+│                                                                 │
+│ 2. Fetch tool schemas from ExtensionManager:                    │
+│    - List tools from each enabled MCP server                    │
+│    - Normalize schema (trim descriptions, etc.)                 │
+│                                                                 │
+│ 3. Prepare messages for provider:                               │
+│    - Filter agent_visible messages only                         │
+│    - Merge consecutive tool requests/results                    │
+│    - Add token usage metadata                                   │
+│                                                                 │
+│ 4. Build ModelConfig:                                           │
+│    - Provider name, model, temperature                          │
+│    - Sampling params, tool use mode                             │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ Provider::create_streaming_request()                            │
+│ (e.g., AnthropicProvider, OpenAIProvider, etc.)                 │
+│                                                                 │
+│ 1. Format request per provider API (Anthropic, OpenAI, etc.)   │
+│    - Convert Goose messages to provider format                  │
+│    - Serialize tools to provider schema                         │
+│    - Set streaming: true                                        │
+│                                                                 │
+│ 2. Send HTTP POST to provider (Anthropic, OpenAI, etc.)        │
+│    - Include system prompt, messages, tools, model             │
+│    - With cache headers if supported                            │
+│                                                                 │
+│ 3. Stream response chunks:                                      │
+│    - Parse delta events (text, tool_use start/end, etc.)       │
+│    - Buffer into tokens, emit to agent                         │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ Provider Response handling:                                     │
+│                                                                 │
+│ - AssistantMessage with:                                        │
+│   - Text content + ToolRequest[]                                │
+│   - Usage metadata (input_tokens, output_tokens)                │
+│   - finish_reason (stop, tool_use, etc.)                        │
+│   - model, latency, cost                                        │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ Append LLM response to conversation:                            │
+│ Conversation = [..., UserMessage, AssistantMessage]            │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ ToolExecutionOperation::run() (if tool calls present)           │
+│                                                                 │
+│ For each ToolRequest in AssistantMessage:                       │
+│                                                                 │
+│   1. Categorize tool (Shell / Write / Read / Other)             │
+│                                                                 │
+│   2. ToolApprovalOperation:                                     │
+│      IF tool is dangerous (Shell/Write):                        │
+│        - Run PermissionJudge (LLM analyzes intent)              │
+│        - If needs confirmation:                                │
+│          - Emit ActionRequired event → UI modal                 │
+│          - Block until user approval/denial                     │
+│                                                                 │
+│   3. Approved: Call MCP server:                                 │
+│      - Find extension for tool (by prefix)                      │
+│      - Call callTool(name, arguments) on MCP client            │
+│      - Receive CallToolResult (content, error, etc.)            │
+│                                                                 │
+│   4. Parse result:                                              │
+│      - If success: extract content (text, file, image, etc.)   │
+│      - If error: format error message                           │
+│      - If size > limit: truncate or summarize                   │
+│                                                                 │
+│   5. Append ToolResult to conversation:                         │
+│      Conversation = [..., ToolRequest, ToolResult]             │
+│                                                                 │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ Apply Effects (StateMachine::apply):                            │
+│                                                                 │
+│ SessionManager::add_message(AssistantMessage)                   │
+│ SessionManager::add_message(ToolResult[])                       │
+│ SessionManager::update(usage_metadata)                          │
+│                                                                 │
+│ All persisted to SQLite                                         │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ Check loop condition:                                           │
+│                                                                 │
+│ IF result.yield_to_client:                                      │
+│   - Stop and return to UI/CLI (streaming displayed to user)    │
+│ ELSE:                                                           │
+│   - Loop back to StateMachine::step()                           │
+│   - LLM continues reasoning with tool results                  │
+│   - Repeat until yield_to_client or no applicable ops          │
+│                                                                 │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ Emit events to UI/CLI:                                          │
+│ - StreamingMessage (LLM response chunks)                        │
+│ - ToolExecutedNotification (tool call result)                   │
+│ - TurnCompleted (agent turn finished)                           │
+│ - SessionUpdated (new messages in history)                      │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ UI/CLI displays response to user                                │
+│ Session history updated in real-time                            │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Critical Path Highlights:
+
+1. **System Prompt Injection**: `.goosehints` + enabled extensions dynamically added
+2. **Tool Discovery**: MCP ListTools called on startup, cached per session
+3. **Approval Gate**: Before dangerous tool execution, LLM judges intent + user confirms
+4. **Streaming Loop**: Single turn can produce multiple back-and-forths (tool results)
+5. **Persistence**: Every message persisted immediately (SQLite)
+6. **Re-entrancy**: Agent continues after tool results (no user interaction needed)
+
+---
+
+## 20. Weaknesses / Gaps
+
+### Architectural Limitations
+
+1. **Limited Hierarchy**
+   - Sub-agents max depth = 2 (main → task)
+   - No explicit agent-to-agent message passing
+   - No shared memory between subagents
+   - **Gap**: Complex multi-agent workflows require external orchestration
+
+2. **No Distributed Execution**
+   - Single-machine only (no cluster support)
+   - Goose runs on user's laptop/server
+   - **Gap**: Scaling to thousands of concurrent sessions requires external queue/broker
+
+3. **Simplistic Planning**
+   - Recipes are linear (sub-recipes in sequence)
+   - No automatic plan generation (LLM can't modify recipe mid-execution)
+   - No backtracking if recipe step fails
+   - **Gap**: Complex planning scenarios need external workflow orchestrator
+
+4. **Tool Context Limitation**
+   - Tool schemas not in-context per step (listed once at inference time)
+   - Dynamic tool discovery (adding tool mid-session) not fully supported
+   - **Gap**: Interactive tool negotiation not supported
+
+### Feature Gaps
+
+5. **Memory/Retrieval**
+   - No vector DB integration (RAG)
+   - Only session-level history (no cross-session memory)
+   - Compaction loses nuance (summarized away)
+   - **Gap**: Long-term learning and retrieval-augmented generation missing
+
+6. **Evaluation Framework**
+   - `goose-self-test.yaml` is manual (not automated benchmarking)
+   - No A/B testing framework
+   - No automated metric collection
+   - **Gap**: Production observability of agent quality is limited
+
+7. **Cost Optimization**
+   - No multi-model routing (e.g., cheap model for easy tasks, expensive for hard)
+   - No caching of tool results across sessions
+   - Token usage tracked but not optimized
+   - **Gap**: Cost control for high-volume deployments weak
+
+8. **HTTP API**
+   - No separate server crate (embedded in goose CLI)
+   - API schema not auto-generated (manual OpenAPI definition)
+   - Limited API versioning strategy
+   - **Gap**: Embedding goose in third-party services is friction-heavy
+
+9. **Extension Security**
+   - MCP servers run with full user privileges
+   - No capability-based security model (e.g., filesystem sandboxing)
+   - Malware detection is optional & best-effort
+   - **Gap**: Untrusted extensions pose security risk
+
+10. **Desktop App Separation**
+    - UI (TypeScript/Electron) not deeply integrated with agent core
+    - Agent logic in Rust, UI state in TypeScript (dual sources of truth)
+    - No unified data model
+    - **Gap**: Complex features require coordination across Rust/TS codebases
+
+### Known Technical Debt
+
+11. **Dual Agent Loop**
+    - Legacy `agents/agent.rs` + new `agents/state_machine/`
+    - Changes must maintain parity
+    - Migration ongoing (enable via GOOSE_STATE_MACHINE=1)
+    - **Gap**: Code duplication & maintenance burden
+
+12. **Session Naming**
+    - Auto-names are generic ("Conversation 1")
+    - LLM-based naming is opt-in
+    - No search/filtering by semantic meaning
+    - **Gap**: Session management at scale is poor
+
+13. **Error Handling**
+    - Tool failures not deeply analyzed
+    - No retry strategies per tool type
+    - User sees raw errors sometimes
+    - **Gap**: Robustness in face of transient failures is weak
+
+14. **Configuration Complexity**
+    - Many feature flags (local-inference, otel, aws-providers, code-mode)
+    - Binary size bloat for all features
+    - No "minimal" build option
+    - **Gap**: Deployment flexibility is limited
+
+### Performance Considerations
+
+15. **Context Window Management**
+    - Compaction is LLM-based (expensive)
+    - No sliding window strategy
+    - Large conversations slow to load/save
+    - **Gap**: Scaling to very long conversations (>100K tokens) is problematic
+
+16. **Extension Startup**
+    - Each extension spawned as separate process
+    - No connection pooling/reuse
+    - Cold starts (first tool call per session) slow
+    - **Gap**: Latency-sensitive workflows impacted
+
+---
+
+## Summary: Goose as an Agentic Harness
+
+### Strengths:
+✓ **Clean state machine abstraction** — Composable, testable agent operations  
+✓ **MCP-first design** — Universal tool ecosystem, extensible  
+✓ **Local-first execution** — Privacy-preserving, offline capable  
+✓ **Multiple LLM support** — 15+ providers, unified interface  
+✓ **Rich permission model** — Three-layer approval (rules, LLM, human)  
+✓ **Session persistence** — SQLite-backed, resumable workflows  
+✓ **Recipe system** — Templated multi-turn workflows  
+✓ **Production-ready** — OpenTelemetry, structured logging, error handling  
+
+### Weaknesses:
+✗ **Limited multi-agent orchestration** — Max depth 2, no hierarchies  
+✗ **No RAG/memory** — Session-scoped only  
+✗ **Weak planning** — Linear recipes, no auto-adaptation  
+✗ **Distributed execution** — Single-machine only  
+✗ **API complexity** — Embedded HTTP, manual OpenAPI  
+✗ **Extension security** — Full user privileges, best-effort malware detection  
+
+### Best Use Cases:
+- **Local AI coding assistant** — CLI + Desktop for developers
+- **Workflow automation** — Recipes for repetitive tasks
+- **Research & analysis** — Long-form reasoning with tool support
+- **Desktop automation** — Computer control via MCP
+- **Multi-provider switching** — Works with any LLM via config
+
+### Not Suitable For:
+- Multi-agent swarms or hierarchies
+- Real-time systems (latency-sensitive)
+- Untrusted code execution (sandboxing limited)
+- High-throughput production APIs (not designed for it)
+- Closed-loop autonomous loops (no safety guardrails for pure autonomy)
+
+---
+
+**Analysis Date:** 2025-08-23  
+**Repository:** https://github.com/aaif-goose/goose  
+**License:** Apache 2.0  
+**Maintained By:** Agentic AI Foundation (Linux Foundation)

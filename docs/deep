@@ -1,0 +1,873 @@
+Now I'll compile a comprehensive architectural analysis of the Deep Agents repository.
+
+---
+
+# Deep Agents Repository - Comprehensive Architectural Analysis
+
+## 1. Project Identity & Purpose
+
+**Deep Agents** is a production-ready, opinionated agent harness built on top of LangChain and LangGraph. It's marketed as "batteries-included" — providing sensible defaults out of the box while remaining fully extensible. The core philosophy is stated in the README:
+
+> "An opinionated agent that runs out of the box. Extend, override, or replace any piece."
+
+**Problem domain**: Long-horizon, multi-step autonomous work by AI agents — research, coding, content creation, data analysis. It abstracts over the complexity of managing agent state, filesystem access, sub-agent delegation, context overflow, and human approval loops.
+
+**Repository location**: [libs/deepagents/](libs/deepagents/) — core SDK only. This is the foundation; satellite packages ([libs/code/](libs/code/), [libs/cli/](libs/cli/)) build specialized experiences on top.
+
+**Tagline**: From [README.md](README.md) — "The batteries-included agent harness."
+
+---
+
+## 2. Languages & Runtime
+
+- **Primary language**: Python 3.11+
+- **Supported versions**: Python 3.11, 3.12, 3.13, 3.14 (per [pyproject.toml](libs/deepagents/pyproject.toml#L7))
+- **Package manager**: `uv` (Rust-based; replaces pip/poetry)
+- **Build system**: `setuptools` + `wheel`
+- **Development**: `make` for task orchestration; Makefile per-package
+- **Testing framework**: `pytest` with asyncio support (auto mode enabled)
+- **Type checking**: `ty` (proprietary LangChain type checker based on pyright)
+- **Code formatting/linting**: `ruff` with strict settings (all rules enabled by default)
+
+**Key runtime note**: Uses `uv sync --all-groups` for dependency installation. No global Python required — `uv` provisions the right interpreter automatically.
+
+---
+
+## 3. Dependencies
+
+### Direct Core Dependencies
+From [libs/deepagents/pyproject.toml](libs/deepagents/pyproject.toml#L18-L27):
+
+```
+langchain>=1.3.16,<2.0.0                    # Agent abstraction layer
+langchain-core>=1.6.0,<2.0.0                # Serializable runnables, messages, tools
+langchain-anthropic>=1.6.1,<2.0.0           # Anthropic chat model support
+langchain-google-genai>=4.3.4,<5.0.0        # Google Generative AI support
+langsmith>=0.11.1                           # Tracing, observability, eval platform
+packaging>=23.2                             # Version parsing
+wcmatch>=11.0                               # Glob patterns (wcglob used for filesystem)
+```
+
+### Optional Dependencies
+```
+langchain-aws>=1.7.2,<2.0.0                 # Bedrock prompt caching
+langchain-quickjs>=0.3.5                    # QuickJS sandboxing (JavaScript runtime)
+av>=18.0.0,<19.0.0, pillow>=12.3.0,<13.0.0 # Video frame extraction
+```
+
+### Implicit Dependencies (via LangChain)
+- **LLM provider SDKs**: langchain-openai, langchain-fireworks, etc. (optional, installed by user based on model choice)
+- **LangGraph**: Runtime for agent graphs, streaming, persistence, checkpointing
+- **Pydantic**: Data validation and structured outputs
+- **asyncio** (stdlib): Async/await support
+
+### No MCP Dependency in Core
+Deep Agents itself does **not** depend on an MCP library in the core SDK. However:
+- Partners package `libs/partners/` includes MCP integrations
+- Deep Agents Code ([libs/code/](libs/code/)) has MCP server integration via `langchain-core.tools`
+- CLI ([libs/cli/](libs/cli/)) can reference MCP servers by URL (managed deployment mode)
+
+---
+
+## 4. Top-Level Directory Layout
+
+### Root Level
+```
+/workspaces/literate-winner/reference/deepagents/
+├── README.md                       # Main docs overview and quickstart
+├── AGENTS.md                       # Monorepo-wide development rules, contribution policy, CI/CD
+├── LICENSE                         # MIT license
+├── action.yml                      # GitHub Action wrapper (runs dcode non-interactively)
+├── .mcp.json                       # MCP server config for docs access
+├── setup.sh                        # Setup script (root level)
+├── .github/                        # CI workflows, release automation, PR templates
+├── docs/                           # Docsite markdown (for langchain-ai/docs repo reference)
+├── libs/                           # Main monorepo of independently versioned packages
+├── reference/                      # (parent level) Contains this repo + 7 other reference repos
+└── openwiki/                       # Generated evidence index (optional, JIT context)
+```
+
+### [libs/](libs/) Monorepo Structure
+```
+libs/
+├── DEVELOPMENT.md              # Setup, edit-test-lint loop, benchmarks
+├── ARCHITECTURE.md             # Runtime structure, middleware stack, state flow
+├── Makefile                    # Fan-out make targets (lint, test, lock all packages)
+├── deepagents/                 # Core SDK (the main agent harness)
+│   ├── deepagents/             # Python package source
+│   │   ├── __init__.py         # Public API exports
+│   │   ├── graph.py            # create_deep_agent() — main entry point, ~1000 LOC
+│   │   ├── _models.py          # Model resolution (provider aliases, Bedrock detection)
+│   │   ├── _tools.py           # Tool inspection, description overrides
+│   │   ├── _messages_reducer.py# DeltaChannel reducer (checkpoint growth O(N) not O(N²))
+│   │   ├── middleware/         # Core middleware stack (12 modules)
+│   │   ├── backends/           # File storage abstraction (6 modules)
+│   │   ├── profiles/           # Harness + provider profiles for model-specific tuning
+│   │   └── _api/               # Deprecation warnings, internal APIs
+│   ├── tests/                  # Unit + integration tests, benchmarks
+│   ├── pyproject.toml          # Package metadata, dependencies, pytest config
+│   └── README.md               # SDK-specific docs
+├── cli/                        # deepagents-cli: deployment, scaffolding, MCP wiring
+├── code/                       # deepagents-code: interactive terminal agent (dcode)
+├── acp/                        # Agent Client Protocol integration
+├── evals/                      # Evaluation suite, Harbor integration
+├── talon/                      # Local runtime host for long-running agents
+└── partners/                   # Provider/sandbox integrations (daytona, modal, vercel, etc.)
+    ├── daytona/, modal/, vercel/, runloop/, quickjs/
+    └── AGENTS.md               # Partner CI/release wiring
+```
+
+---
+
+## 5. Agent Architecture
+
+### 5.1 Main Agent Loop Control Flow
+
+**Entry point**: [graph.py#L268](libs/deepagents/deepagents/graph.py#L268) — `create_deep_agent()`
+
+This function (650+ lines) does three things:
+1. **Model resolution**: Converts string model IDs (e.g., `"openai:gpt-5.5"`) to `BaseChatModel` instances via `resolve_model()`.
+2. **Middleware stack assembly**: Constructs a layered middleware stack (details below).
+3. **Graph compilation**: Delegates to LangChain's `create_agent()` which builds a LangGraph state graph.
+
+**Return type**: `CompiledStateGraph` — a LangGraph-compiled runnable agent graph.
+
+### 5.2 Agent Type: Hierarchical Planner-Executor with Delegation
+
+- **Single-agent at top level**: One main agent loop.
+- **Multi-agent via sub-agents**: Main agent can spawn isolated sub-agents using the `task` tool.
+- **Three sub-agent patterns**:
+  - **Declarative** ([SubAgent](libs/deepagents/deepagents/middleware/subagents.py#L38)): TypedDict spec with name, description, system_prompt, optional tools/model/middleware. Compiled at runtime.
+  - **Pre-compiled** ([CompiledSubAgent](libs/deepagents/deepagents/middleware/subagents.py#L159)): Caller provides a pre-built LangGraph runnable.
+  - **Async/remote** ([AsyncSubAgent](libs/deepagents/deepagents/middleware/async_subagents.py#L34)): Launched on Agent Protocol servers, returns immediately with a task ID.
+- **Default sub-agent**: If caller doesn't name one `general-purpose`, one is auto-added with standard research/coding behaviors.
+
+### 5.3 State Management
+
+**State object**: [DeepAgentState](libs/deepagents/deepagents/graph.py#L59) — extends LangChain's `AgentState`:
+
+```python
+class DeepAgentState(AgentState):
+    messages: Required[Annotated[
+        list[AnyMessage], 
+        DeltaChannel(_messages_delta_reducer, snapshot_frequency=50)
+    ]]
+```
+
+- **Key field**: `messages` (message history as list of `AnyMessage`)
+- **Special reducer**: `DeltaChannel` with custom `_messages_delta_reducer` ([_messages_reducer.py](libs/deepagents/deepagents/_messages_reducer.py)) reduces checkpoint growth from O(N²) to O(N) by using message deduplication and incremental updates.
+- **Private state**: Middleware can add private fields (prefixed or marked via `PrivateStateAttr`) that don't leak into subagents.
+- **Custom fields**: Callers can extend `DeepAgentState` with typed fields via `state_schema=MyState` parameter.
+
+**Persistence**: Handled by LangGraph's checkpointer (optional `checkpointer` parameter). State survives thread pauses, resumptions, and interrupts.
+
+### 5.4 Message & History Representation
+
+- **Message types**: `HumanMessage`, `AIMessage`, `ToolMessage`, `SystemMessage`, `RemoveMessage`
+- **Tool calls**: Embedded in `AIMessage.tool_calls` as structured `ToolCall` objects with name, args, ID.
+- **Message ID deduplication**: LangGraph's `ensure_message_ids` assigns stable UUIDs before reducer runs (per [_messages_reducer.py](libs/deepagents/deepagents/_messages_reducer.py#L12-L14)).
+- **History compaction**: [SummarizationMiddleware](libs/deepagents/deepagents/middleware/summarization.py) can offload old messages to disk as markdown when token count exceeds a threshold.
+- **Message eviction policy**: Evicted messages are stored under `/conversation_history/{session_id}.md` with media (base64) in separate `/conversation_history/media/` subdirectory.
+
+---
+
+## 6. LLM Provider Abstraction
+
+### Model Resolution
+
+[_models.py](libs/deepagents/deepagents/_models.py#L28) — `resolve_model()` function:
+
+1. **String model IDs**: Parsed as `provider:model_name` (e.g., `"openai:gpt-5.5"`, `"anthropic:claude-sonnet-4-6"`).
+2. **Provider profile lookup**: Calls `apply_provider_profile(model)` to inject provider-specific config (e.g., OpenAI Responses API defaults, NIM attribution headers).
+3. **Init chat model**: Delegates to LangChain's `init_chat_model()`.
+4. **Pre-initialized models**: If caller passes a `BaseChatModel` instance, used as-is.
+
+### Supported Providers
+
+- **Frontier APIs**: OpenAI, Anthropic, Google Generative AI (built-in deps); Azure OpenAI, Bedrock (optional)
+- **Open-weight hosted**: Fireworks, Baseten, Together AI, vLLM, Ollama (via LangChain)
+- **Self-hosted**: ollama, llama.cpp, vLLM (via LangChain chat model integrations)
+
+### Model Routing & Profiles
+
+[Harness profiles](libs/deepagents/deepagents/profiles/harness/harness_profiles.py) tune behavior per model:
+- **Provider profiles** ([provider_profiles.py](libs/deepagents/deepagents/profiles/provider/provider_profiles.py)): Pre-construction (API keys, headers, Responses API mode).
+- **Harness profiles**: Post-construction (prompt caching, tool exclusions, middleware tuning).
+- **Automatic profile resolution**: `_harness_profile_for_model()` looks up model-specific or provider-level profiles.
+
+### Streaming
+
+- **Enabled by default**: LangGraph's `astream_events()` streams token-by-token as the agent executes.
+- **Access**: Via `agent.stream()` or `agent.astream()` methods.
+- **Observability**: Events include `agent.start`, `tool.start`, `tool.end`, `agent.end`.
+
+---
+
+## 7. Tool System
+
+### Tool Definition
+
+Tools are defined in three ways (from [_tools.py](libs/deepagents/deepagents/_tools.py)):
+
+1. **LangChain @tool decorator**:
+   ```python
+   @tool(description="Search the web")
+   def tavily_search(query: str) -> str:
+       ...
+   ```
+   
+2. **StructuredTool class**:
+   ```python
+   StructuredTool.from_function(func, name="my_tool", description="...")
+   ```
+
+3. **Dict with OpenAI schema**:
+   ```python
+   {"name": "tool_name", "description": "...", "parameters": {...}}
+   ```
+
+### Built-In Tools
+
+From [FilesystemMiddleware](libs/deepagents/deepagents/middleware/filesystem.py#L1556):
+
+**Filesystem** (always present):
+- `ls(path)` — list directory
+- `read_file(path, [start_line], [end_line])` — read file (with optional line range)
+- `write_file(path, content)` — create/overwrite
+- `edit_file(path, old_str, new_str)` — substring replacement
+- `glob(pattern)` — find files matching wildcard pattern
+- `grep(pattern, [path])` — search regex with line context
+
+**Shell** (if backend supports `SandboxBackendProtocol`):
+- `execute(command, [timeout])` — run shell command in sandbox
+
+**Sub-agents** (if subagents configured):
+- `task(subagent_name, task_description)` — delegate to a subagent
+
+**Memory** (if memory configured):
+- System prompt injection (no explicit tool, pure prompt augmentation)
+
+**Skills** (if skills configured):
+- Dynamic tool injection when agent chooses to load a skill
+
+### Tool Call Dispatch
+
+1. **Model decision**: LLM decides which tool(s) to call, emits `tool_calls` on `AIMessage`.
+2. **Middleware interception**: [PatchToolCallsMiddleware](libs/deepagents/deepagents/middleware/patch_tool_calls.py) patches dangling tool calls (those without responses).
+3. **Execution**: LangChain invokes tools in parallel; results appended as `ToolMessage` with `tool_call_id`.
+4. **Feedback loop**: Model sees results, either calls more tools or generates a final response.
+
+### Sandboxing & Permission Model
+
+[FilesystemPermission](libs/deepagents/deepagents/middleware/filesystem.py#L77):
+
+```python
+@dataclass
+class FilesystemPermission:
+    path_pattern: str        # Glob pattern: "/tmp/**", "/etc/**"
+    mode: Literal["allow", "deny", "interrupt"]
+    tools: list[FsToolName]  # Specific tools: ["write_file", "execute"]
+```
+
+**Evaluation**: Rules in declaration order; first match wins. Defaults to allow.
+
+**Modes**:
+- `"allow"`: Proceeds.
+- `"deny"`: Returns permission-denied error.
+- `"interrupt"`: Pauses for human approval via `HumanInTheLoopMiddleware`.
+
+**Backend sandboxing**: Separate from permissions. Backends (e.g., `LocalShellBackend`) can restrict shell access. [BaseSandbox](libs/deepagents/deepagents/backends/sandbox.py) implements `SandboxBackendProtocol` for containerized or isolated execution.
+
+---
+
+## 8. Prompt & System Message Strategy
+
+### Prompt Assembly
+
+From [graph.py#L550-L600](libs/deepagents/deepagents/graph.py#L550):
+
+Three-part assembly: **USER** → **BASE** → **SUFFIX**
+
+1. **USER**: Caller-supplied `system_prompt` parameter (string or `SystemMessage`).
+2. **BASE**: Profile's `base_system_prompt` (if any).
+3. **SUFFIX**: Profile's `system_prompt_suffix` (if any).
+
+Parts are separated by blank lines.
+
+### Memory Injection
+
+[MemoryMiddleware](libs/deepagents/deepagents/middleware/memory.py) loads AGENTS.md files and injects them into the system prompt. Sources are paths like `["~/.deepagents/AGENTS.md", "./.deepagents/AGENTS.md"]`; content is combined in order.
+
+### Skills Disclosure
+
+[SkillsMiddleware](libs/deepagents/deepagents/middleware/skills.py) progressively loads skills from SKILL.md files. Skill descriptions are injected into the system prompt as available options.
+
+### Default Prompt (Deprecated)
+
+Pre-0.7.0, Deep Agents shipped a default prompt (`BASE_AGENT_PROMPT`). As of 0.7.0, this is deprecated — models receive an empty authored prompt unless the caller or profile provides one.
+
+### Prompt Caching
+
+Anthropic prompt caching is **auto-enabled** via [_prompt_caching.py](libs/deepagents/deepagents/middleware/_prompt_caching.py) middleware:
+- Marks stable prompt prefixes with `cache_control="ephemeral"`.
+- Also supports Bedrock and Fireworks prompt caching (if optional deps installed).
+- No-ops for non-Anthropic models.
+
+---
+
+## 9. Memory & Context Management
+
+### Virtual File System
+
+[FileSystem middleware](libs/deepagents/deepagents/middleware/filesystem.py) abstracts over three backend implementations:
+
+1. **StateBackend** (default): Files stored in LangGraph agent state (`messages` + custom `files` channel). Ephemeral, no I/O, checkpoint-scoped.
+2. **FilesystemBackend**: Direct filesystem access. Paths are real; supports ripgrep for fast grep.
+3. **StoreBackend**: LangGraph's persistent store (namespace-scoped, e.g., `("filesystem",)`).
+
+Backends implement [BackendProtocol](libs/deepagents/deepagents/backends/protocol.py): `read()`, `write()`, `edit()`, `delete()`, `ls()`, `glob()`, `grep()`, etc.
+
+### Context Compaction
+
+[SummarizationMiddleware](libs/deepagents/deepagents/middleware/summarization.py):
+- Monitors message token count.
+- When count exceeds threshold (configurable `trigger`), calls the LLM to summarize older messages.
+- Offloads evicted messages to `/conversation_history/{session_id}.md` (markdown).
+- Keeps recent `N` messages (configurable `keep`).
+
+### Long-Term Memory
+
+[Memory files (AGENTS.md)](libs/deepagents/deepagents/middleware/memory.py):
+- Markdown files with project context, code patterns, build commands.
+- Loaded at agent startup.
+- Injected into system prompt (with cache control for Anthropic).
+
+---
+
+## 10. Planning Subsystem
+
+### Todo Middleware (Not Deep Agents Specific)
+
+LangChain's [TodoListMiddleware](https://docs.langchain.com/oss/python/langchain/middleware/overview) (not in Deep Agents core, but available) exposes a `todo_add` and `todo_mark_done` tool.
+
+### Implicit Planning
+
+The default system prompt (legacy, pre-0.7.0) included guidance on the ReAct loop:
+- Understand the user's goal.
+- Break into steps.
+- Execute iteratively.
+- Verify against the goal.
+
+Deep Agents does **not** enforce a planner phase — instead, the LLM naturally plans via tool use.
+
+### Task Decomposition via Sub-agents
+
+The `task` tool (from [SubAgentMiddleware](libs/deepagents/deepagents/middleware/subagents.py)) allows the main agent to delegate work:
+- Agent describes the delegated task.
+- Sub-agent receives isolated context window.
+- Main agent sees the result.
+
+This is the framework's way of handling complex hierarchical work.
+
+---
+
+## 11. Sub-Agents & Delegation
+
+### SubAgent Specification
+
+From [subagents.py#L38](libs/deepagents/deepagents/middleware/subagents.py#L38):
+
+```python
+class SubAgent(TypedDict):
+    name: str                              # Unique ID
+    description: str                       # When to delegate
+    system_prompt: str                     # Agent's instructions
+    tools: NotRequired[...]                # Optional; inherits from main if omitted
+    model: NotRequired[str | BaseChatModel]# Optional; inherits from main if omitted
+    middleware: NotRequired[list]          # Custom middleware for this subagent
+    interrupt_on: NotRequired[...]         # Human approval rules
+    skills: NotRequired[list[str]]         # Skill paths
+    permissions: NotRequired[...]          # Filesystem rules
+    response_format: NotRequired[...]      # Structured output schema
+```
+
+### Execution Model
+
+1. **Main agent calls `task(subagent_name, task_description)`.**
+2. **SubAgentMiddleware intercepts**: Looks up subagent spec, compiles if needed.
+3. **Sub-agent runs**: Gets same middleware stack as main (unless overridden), isolated state window.
+4. **Result extraction**: 
+   - If `response_format` provided: JSON-serialized structured response returned.
+   - Otherwise: Last non-empty `AIMessage.content` extracted.
+5. **Main agent receives result** as `ToolMessage`.
+
+### Isolation & Inheritance
+
+- **Context window**: Subagent starts fresh; doesn't see main agent's prior messages.
+- **Tools inheritance**: Subagent inherits main agent's tools unless overridden.
+- **Permissions inheritance**: Subagent inherits main's filesystem rules unless `permissions` specified on SubAgent.
+- **State inheritance**: If main agent passes `state_schema=MyState`, subagents see the same schema.
+
+### Async Sub-agents (Remote)
+
+[AsyncSubAgentMiddleware](libs/deepagents/deepagents/middleware/async_subagents.py):
+- Connects to remote [Agent Protocol](https://github.com/langchain-ai/agent-protocol) servers.
+- Launches background tasks via LangGraph SDK.
+- Exposes async tools: `launch_task`, `check_task`, `update_task`, `cancel_task`, `list_tasks`.
+- Compatible with LangGraph Platform (managed) and self-hosted servers.
+
+---
+
+## 12. Human-in-the-Loop
+
+### HumanInTheLoopMiddleware
+
+From LangChain's `langchain.agents.middleware`, configured via `interrupt_on` parameter:
+
+```python
+interrupt_on = {
+    "edit_file": True,                 # Always interrupt before edit
+    "task": InterruptOnConfig(
+        when=lambda req: ...,          # Conditional interrupt (e.g., if file size > 10MB)
+    ),
+}
+```
+
+### Integration with Permissions
+
+If `permissions` includes `mode="interrupt"`, a `HumanInTheLoopMiddleware` is auto-installed. User-supplied `interrupt_on` entries merge with permission-generated ones (user entries win per tool name).
+
+### Approval Flow
+
+1. Agent tries to call a tool marked for interruption.
+2. Graph pauses before tool execution.
+3. Human reviews the request via the graph's `interrupt_before` mechanism.
+4. Human approves, rejects, or modifies the request.
+5. Graph resumes with the approved/modified call.
+
+Requires a [Checkpointer](https://docs.langchain.com/oss/python/langgraph/checkpointers) for persistence across pause/resume.
+
+---
+
+## 13. Sandboxing & Safety
+
+### Backends
+
+1. **StateBackend**: No I/O; safe by design (files ephemeral in memory).
+2. **FilesystemBackend**: Direct filesystem access. **Warning**: Requires wrapping in a sandbox or running with restricted permissions.
+3. **BaseSandbox**: [Base class](libs/deepagents/deepagents/backends/sandbox.py) for pluggable sandboxes:
+   - Implements [SandboxBackendProtocol](libs/deepagents/deepagents/backends/protocol.py) (file + shell operations).
+   - File operations use shell commands (ls, grep, glob via subprocess).
+   - Shell commands via `execute()` (overridden by concrete sandboxes).
+4. **CompositeBackend**: Routes paths to different backends (e.g., state for temp, filesystem for persistent).
+
+### Concretizations
+
+- **LocalShellBackend**: Runs commands locally (no isolation; for local dev).
+- **Partner sandboxes**: [Modal](libs/deepagents/deepagents/backends/../../../partners/modal/), [Vercel Functions](libs/deepagents/deepagents/backends/../../../partners/vercel/), [Daytona](libs/deepagents/deepagents/backends/../../../partners/daytona/) (managed cloud runtimes).
+
+### Secret Handling
+
+No built-in secret masking in Deep Agents core. Relies on:
+- `LANGSMITH_API_KEY` environment variable (for observability).
+- Provider API keys (OpenAI, Anthropic, etc.) via env vars or LangChain's credential loaders.
+- Users must ensure agent sandboxes do not leak secrets in stderr/stdout.
+
+### Filesystem Permissions
+
+See section 7 (Tool System). Policies defined as glob patterns + mode (allow/deny/interrupt).
+
+---
+
+## 14. Observability
+
+### LangSmith Integration
+
+- **Tracing**: All agent runs are auto-traced to LangSmith (if `LANGSMITH_API_KEY` set).
+- **Langsmith dependency**: [langsmith>=0.11.1](libs/deepagents/deepagents/pyproject.toml#L24) in core deps.
+- **Tracing context**: Used by async sub-agents ([async_subagents.py#L10](libs/deepagents/deepagents/middleware/async_subagents.py#L10)) to propagate run IDs.
+
+### Token Counting
+
+[Summarization middleware](libs/deepagents/deepagents/middleware/summarization.py) uses `count_tokens_approximately()` (LangChain) to monitor message buffer size and trigger compaction.
+
+### Debug Mode
+
+`create_deep_agent(debug=True)` parameter (passed to LangChain's `create_agent`). Enables verbose logging.
+
+### Monitoring
+
+Operators can:
+- View runs in LangSmith dashboard.
+- Inspect streamed events via `agent.stream()`.
+- Set up LangSmith evaluators for automatic quality checks.
+
+---
+
+## 15. Evaluation & Testing
+
+### Test Suite
+
+[tests/](libs/deepagents/tests/) includes:
+- **Unit tests**: [unit_tests/](libs/deepagents/tests/unit_tests/) — no network, fast feedback.
+  - [test_graph.py](libs/deepagents/tests/unit_tests/test_graph.py): Metadata, middleware assembly.
+  - [test_end_to_end.py](libs/deepagents/tests/unit_tests/test_end_to_end.py): Full agent runs with fake models.
+  - [test_file_system_tools.py](libs/deepagents/tests/unit_tests/test_file_system_tools.py): Filesystem operations.
+  - [test_permissions.py](libs/deepagents/tests/unit_tests/test_permissions.py): Permission enforcement.
+- **Integration tests**: [integration_tests/](libs/deepagents/tests/integration_tests/) — network allowed (real LLM calls, external APIs).
+- **Benchmarks**: [benchmarks/](libs/deepagents/tests/benchmarks/) — performance regression detection (via `pytest-benchmark`).
+
+### Evals Framework
+
+Separate package [libs/evals/](libs/evals/) — evaluation suite for agent behavior:
+- Eval definitions (e.g., "research accuracy", "code correctness").
+- Harbor integration (LangSmith's evaluation dashboarding).
+- Commands: `uv run evals run`, `uv run evals scorecard`.
+
+### Test Model
+
+Tests use [GenericFakeChatModel](libs/deepagents/tests/unit_tests/chat_model.py) (LangChain's fake) to inject predetermined responses and verify agent behavior without real LLM calls.
+
+---
+
+## 16. Configuration
+
+### Environment Variables
+
+- `LANGSMITH_API_KEY` — required for tracing to LangSmith.
+- `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GOOGLE_API_KEY` — provider API keys (loaded by LangChain).
+- `LANGCHAIN_API_KEY` — fallback for LangSmith auth (optional).
+
+### Configuration Files
+
+**Deep Agents SDK**: No configuration files; everything is Python API.
+
+**Deep Agents CLI** ([libs/cli/](libs/cli/)): Configuration via JSON:
+- `agent.json` — agent metadata (name, model, backend, permissions).
+- `tools.json` — tool definitions (MCP server references).
+- `AGENTS.md` — system prompt / memory.
+- `skills/<name>/SKILL.md` — skill definitions (YAML frontmatter + markdown).
+- `subagents/<name>/` — sub-agent definitions (JSON or Python).
+
+**Deep Agents Code** ([libs/code/](libs/code/)): Startup config via:
+- Command-line flags (model, sandbox, MCP servers, max turns, etc.).
+- `.env` files for API keys.
+
+### Runtime Profiles
+
+[Harness profiles](libs/deepagents/deepagents/profiles/harness/harness_profiles.py) allow model-specific tuning:
+```python
+@register_harness_profile("anthropic:claude-sonnet-4-6")
+class ClaudeSonnetProfile(HarnessProfile):
+    excluded_tools = ["todo_add"]  # Hide todo tool for this model
+    base_system_prompt = "..."     # Override base prompt
+```
+
+---
+
+## 17. Entry Points
+
+### SDK Entry Point
+
+**Function**: [create_deep_agent()](libs/deepagents/deepagents/graph.py#L268)
+
+```python
+from deepagents import create_deep_agent
+
+agent = create_deep_agent(
+    model="openai:gpt-5.5",
+    tools=[my_tool],
+    system_prompt="...",
+    subagents=[...],
+    skills=[...],
+    permissions=[...],
+    backend=StateBackend(),
+)
+
+# Invoke
+result = agent.invoke({"messages": "Your task"})
+
+# Stream
+for event in agent.stream({"messages": "Your task"}):
+    print(event)
+```
+
+### Public API Surface
+
+From [__init__.py](libs/deepagents/deepagents/__init__.py#L1):
+
+```python
+__all__ = [
+    "create_deep_agent",
+    "DeepAgentState",
+    "SubAgent",
+    "CompiledSubAgent",
+    "AsyncSubAgent",
+    "FilesystemMiddleware",
+    "FilesystemPermission",
+    "MemoryMiddleware",
+    "RubricMiddleware",
+    "AsyncSubAgentMiddleware",
+    "GeneralPurposeSubagentProfile",
+    "HarnessProfile",
+    "ProviderProfile",
+    "register_harness_profile",
+    "register_provider_profile",
+]
+```
+
+### CLI Entry Points
+
+[libs/cli/](libs/cli/) and [libs/code/](libs/code/):
+
+- **`deepagents init my-agent`** — scaffold a new agent project.
+- **`deepagents deploy`** — upsert agent to LangSmith managed platform.
+- **`deepagents agents list`** — list workspace agents.
+- **`dcode`** — interactive terminal agent REPL (via `deepagents-code` package).
+- **`dcode -x "prompt"`** — headless mode (single run, exit).
+
+### HTTP API (LangSmith Platform)
+
+Deep Agents deployed via CLI are accessible via LangSmith's `/v1/deepagents/{agent_id}/...` HTTP endpoints.
+
+---
+
+## 18. Notable Idioms & Patterns
+
+### 1. Middleware Stack Composition
+
+Deep Agents' killer feature is **pluggable middleware**. Unlike monolithic agents, every behavior is a middleware layer that can be:
+- Reordered.
+- Replaced.
+- Enabled/disabled.
+- Stacked with custom middleware.
+
+Middleware order (from [graph.py#L558-L589](libs/deepagents/deepagents/graph.py#L558)):
+
+```
+1. SkillsMiddleware (if skills)
+2. FilesystemMiddleware (required)
+3. SubAgentMiddleware (required)
+4. SummarizationMiddleware
+5. PatchToolCallsMiddleware
+6. AsyncSubAgentMiddleware (if async subagents)
+7. [USER MIDDLEWARE]
+8. Profile extra_middleware
+9. _ToolExclusionMiddleware (if excluded_tools)
+10. AnthropicPromptCachingMiddleware (always, no-ops for non-Anthropic)
+11. BedrockPromptCachingMiddleware (if langchain-aws installed)
+12. FireworksPromptCachingMiddleware (if fireworks installed)
+13. MemoryMiddleware (if memory)
+14. HumanInTheLoopMiddleware (if interrupt_on or permission interrupts)
+```
+
+### 2. DeltaChannel for Checkpoint Efficiency
+
+Message history growth in checkpoints typically follows **O(N²)** (each checkpoint stores the full history up to that point). Deep Agents uses LangGraph's `DeltaChannel` with a custom `_messages_delta_reducer` to store only **deltas** (new messages), reducing growth to **O(N)**.
+
+Snapshot frequency: 50 messages (full snapshot every 50 new messages to bound decompression time).
+
+### 3. Profiles for Model-Specific Tuning
+
+Instead of hardcoding Claude-specific or GPT-specific logic, Deep Agents uses a registry pattern:
+
+```python
+@register_harness_profile("anthropic:claude-sonnet-4-6")
+class ClaudeSonnetProfile(HarnessProfile):
+    ...
+
+@register_provider_profile("openai")
+class OpenAIProviderProfile(ProviderProfile):
+    ...
+```
+
+Profiles are discovered automatically when a model is resolved, allowing rapid iteration without changing the core agent loop.
+
+### 4. Declarative Sub-agent Specs
+
+Sub-agents are specified as TypedDicts (not classes), making them JSON-serializable and easy to author/version. CLI and deployment systems rely on this for storing agent definitions.
+
+### 5. Private State Fields for Middleware
+
+Middleware can contribute private state fields that don't leak to subagents:
+
+```python
+class MiddlewareState(AgentState):
+    internal_state: NotRequired[Annotated[dict, PrivateStateAttr]]
+```
+
+This keeps subagents isolated from parent-agent scaffolding.
+
+### 6. Three-Part Prompt Assembly
+
+Splitting user + base + suffix lets profiles inject context without overwriting user input. Memory injection, prompt caching, and model-specific tuning all compose cleanly.
+
+### 7. Tool Description Overrides
+
+Profiles can override tool descriptions via `excluded_tools` and description remapping, allowing model-specific wording without forking tools.
+
+---
+
+## 19. Data Flow Diagram (Textual) — One Request End-to-End
+
+```
+USER: "Research LangGraph and summarize"
+    |
+    v
+agent.invoke({"messages": [HumanMessage("Research...")]})
+    |
+    v
+LangGraph starts graph execution
+    |
+    v
+Middleware.before_agent() [setup]
+    ├─ SkillsMiddleware: Loads available skills, injects into system prompt
+    ├─ MemoryMiddleware: Loads AGENTS.md, injects into system prompt
+    ├─ FilesystemMiddleware: Prepares filesystem tools (ls, read, write, etc.)
+    └─ SubAgentMiddleware: Registers subagent handler for `task` tool
+    |
+    v
+Model request assembled:
+    system_message = [USER] + [BASE profile] + [SUFFIX profile]
+    + [memory content] + [skill descriptions]
+    tools = [filesystem tools] + [execute] + [task] + [user tools]
+    input_messages = [HumanMessage("Research...")]
+    |
+    v
+Middleware.wrap_model_call() [before model]
+    └─ AnthropicPromptCachingMiddleware: Injects cache_control markers
+    |
+    v
+Model inference (e.g., Claude Sonnet):
+    → Decides to use `task` tool to delegate to research subagent
+    → Returns AIMessage with tool_call: name="task", args={"subagent_name": "...", ...}
+    |
+    v
+Tool dispatch:
+    |
+    ├─ PatchToolCallsMiddleware: Checks for dangling tool calls (patches if needed)
+    |
+    └─ Handle tool call (task):
+        |
+        ├─ SubAgentMiddleware intercepts:
+        |   ├─ Looks up subagent spec by name
+        |   ├─ Compiles subagent via create_deep_agent() [recursive]
+        |   ├─ Invokes subagent with isolated context
+        |   └─ Subagent runs through its own middleware stack
+        |       ├─ Runs web search via `execute` + shell
+        |       ├─ Reads search results via `read_file`
+        |       ├─ Calls model to synthesize findings
+        |       └─ Returns summary in ToolMessage
+        |
+        └─ Result: ToolMessage(tool_call_id="...", content="Summary of LangGraph")
+    |
+    v
+State update:
+    messages += [AIMessage(...tool_call...), ToolMessage(...result...)]
+    (DeltaChannel reducer stores only the new messages)
+    |
+    v
+SummarizationMiddleware check:
+    if token_count > threshold:
+        → Summarize old messages
+        → Store in `/conversation_history/{session_id}.md`
+        → Keep only recent N messages
+    |
+    v
+Loop: Go back to model inference
+    → Model sees the ToolMessage result
+    → Decides to use `write_file` to save the summary
+    → FilesystemMiddleware handles: checks permissions, writes to backend
+    |
+    v
+Repeat until model produces final response (no more tool calls)
+    |
+    v
+Model returns: AIMessage(content="I've researched LangGraph and saved a summary to summary.md")
+    |
+    v
+Graph completes
+    |
+    v
+Checkpointer saves state (via DeltaChannel, only new messages persisted)
+    |
+    v
+Return result to caller:
+    agent.invoke(...) → result = {"messages": [...], ...}
+```
+
+---
+
+## 20. Weaknesses & Gaps
+
+### 1. No Built-in Persistent Store Routing
+
+**Gap**: StateBackend is ephemeral (thread-scoped). To persist files across threads or sessions, users must manually configure `StoreBackend` or `FilesystemBackend`. There's no higher-level abstraction (e.g., "use state for this session, then store in backend for next session").
+
+**Workaround**: Use `CompositeBackend` to route paths, but it's low-level and requires manual setup.
+
+### 2. Limited Local Sandboxing
+
+**Gap**: `LocalShellBackend` runs commands unsandboxed on the local machine. For production, users must deploy via CLI to LangSmith managed sandboxes or integrate a third-party sandbox (Modal, Daytona, etc.).
+
+**Workaround**: Deploy to managed platform or use partner sandboxes.
+
+### 3. No Built-in MCP Client in Core SDK
+
+**Gap**: Deep Agents can reference MCP servers via CLI (managed deployment), but the core SDK has no first-class MCP client integration. Tools must be wrapped in `StructuredTool` manually.
+
+**Workaround**: `langchain-core.tools` has MCP support; users can hand-craft MCP tool wrappers. Partners package (`libs/partners/`) has integrations, but it's separate.
+
+### 4. Sub-agent State Schema Inheritance Incomplete for CompiledSubAgent
+
+**Gap**: When a caller provides `state_schema=MyState`, the schema is forwarded to declarative `SubAgent` specs, but `CompiledSubAgent` runnables do not auto-inherit. Callers must manually compile the runnable with the same schema.
+
+**Workaround**: Document it, or pre-compile with matching state schema.
+
+### 5. No Explicit Planner Phase
+
+**Gap**: Deep Agents relies on the LLM's implicit planning (ReAct-style). There's no separate planner step that breaks a goal into subgoals before execution. For very complex multi-step work, some users expect a dedicated planner.
+
+**Workaround**: Use a planner subagent or wrap planning logic in a custom middleware.
+
+### 6. Limited Structured Output for Subagents
+
+**Gap**: `response_format` on subagents is supported, but there's no top-level structured output for the main agent (unlike some frameworks like `langchain-core.structured_output`).
+
+**Workaround**: Manually parse the final `AIMessage.content`.
+
+### 7. No Built-in Token Budgeting Per Subagent
+
+**Gap**: Main agent and subagents share the same model, but there's no way to say "subagent gets max 2000 tokens, main gets 5000." Token budgeting must be manual (via prompt instructions).
+
+**Workaround**: Document token constraints in system prompt.
+
+### 8. Secret Management Not First-Class
+
+**Gap**: No built-in masking of secrets in logs/output. Relies on env vars and sandboxing to prevent leaks.
+
+**Workaround**: Use LangSmith's masking, or run in an isolated sandbox with restricted env.
+
+### 9. Limited Streaming for Subagents
+
+**Gap**: When a subagent is invoked, the main agent blocks until it completes. There's no way to stream subagent output back to the caller in real-time.
+
+**Workaround**: Use async subagents (remote, non-blocking), but they run on separate servers.
+
+### 10. No Rollback or Undo Mechanism
+
+**Gap**: If an agent edits a file or runs a command and the result is undesirable, there's no built-in rollback. Users must manually restore state or use version control.
+
+**Workaround**: Wrap file edits in transactions, or use version-control-aware skills.
+
+---
+
+## Summary
+
+**Deep Agents** is a tightly-engineered, production-ready harness that abstracts the complexity of long-horizon multi-step work. Its key distinguishing feature is the **pluggable middleware architecture**, which allows developers to extend, reorder, or replace any behavior without forking. Combined with **LangGraph's streaming and checkpointing**, **declarative sub-agent specs**, **flexible backend routing**, and **model-specific profiles**, it provides a solid foundation for deploying sophisticated agentic systems.
+
+**Best for**: Research, coding, content generation, and any task requiring autonomous multi-step reasoning, tool use, filesystem interaction, and human oversight.
+
+**Limitations**: Relies on external sandboxes for production isolation, requires manual configuration for persistent storage, and lacks explicit planning phases (though these can be added via middleware or subagents).
+
+The codebase is well-tested, actively maintained, and tightly integrated with LangSmith for observability and deployment.

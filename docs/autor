@@ -1,0 +1,784 @@
+Now I'll compile a comprehensive architectural analysis based on my thorough review of the repository:
+
+---
+
+## **AUTORESEARCH: COMPREHENSIVE ARCHITECTURAL ANALYSIS**
+
+### **1. Project Identity & Purpose**
+
+**Name:** autoresearch  
+**Core Concept:** An autonomous AI research agent that runs continuous model training experiments overnight, iteratively modifying a GPT-2-style training codebase to optimize validation loss.
+
+From [README.md](README.md#L1):
+> *"The idea: give an AI agent a small but real LLM training setup and let it experiment autonomously overnight. It modifies the code, trains for 5 minutes, checks if the result improved, keeps or discards, and repeats."*
+
+**Problem Domain:**
+- Autonomous neural architecture search via LLM-guided hyperparameter optimization
+- Expedited research iteration (12 experiments/hour, ~100 overnight)
+- Self-contained, reproducible single-GPU training as a research platform
+
+**Domain Classification:** LLM-based AutoML / agent-directed neural architecture optimization
+
+---
+
+### **2. Languages & Runtime**
+
+| Aspect | Details |
+|--------|---------|
+| **Primary Language** | Python (pure Python + PyTorch) |
+| **Python Version** | ≥3.10 ([pyproject.toml](pyproject.toml#L5)) |
+| **Build System** | None; uses `uv` as package manager |
+| **Package Manager** | `uv` (Astral) ([README.md](README.md#L26)) |
+| **Execution Model** | Single-GPU CUDA (NVIDIA, tested H100) |
+| **Runtime Dependency** | PyTorch 2.9.1 with CUDA 12.8 ([pyproject.toml](pyproject.toml#L18)) |
+
+---
+
+### **3. Dependencies**
+
+[pyproject.toml](pyproject.toml#L8-L19):
+
+| Dependency | Version | Purpose |
+|------------|---------|---------|
+| **torch** | 2.9.1 | Core deep learning framework; CUDA 12.8 index |
+| **kernels** | ≥0.11.7 | Flash Attention 3 kernels integration ([train.py](train.py#L17-L19)) |
+| **tiktoken** | ≥0.11.0 | OpenAI tokenizer; BPE encoding/decoding |
+| **rustbpe** | ≥0.1.0 | Fast BPE tokenizer training (Rust-based) |
+| **pyarrow** | ≥21.0.0 | Parquet data I/O (HuggingFace dataset shards) |
+| **numpy** | ≥2.2.6 | Numerical operations |
+| **pandas** | ≥2.3.3 | Data manipulation utility |
+| **matplotlib** | ≥3.10.8 | Plotting (used in analysis.ipynb) |
+| **requests** | ≥2.32.0 | HTTP downloads for dataset shards ([prepare.py](prepare.py#L75)) |
+
+**LLM Providers:** None directly integrated (agent uses Claude/Codex via IDE)  
+**Agent Frameworks:** None (agents interact via instruction files only)  
+**MCP Libraries:** None  
+**Observability:** Built-in stdout metrics; no distributed tracing
+
+---
+
+### **4. Top-Level Directory Layout**
+
+| File/Folder | Lines | Purpose |
+|-------------|-------|---------|
+| [README.md](README.md) | ~200 | Project documentation, quickstart, design choices |
+| [prepare.py](prepare.py) | ~400 | **Read-only.** One-time data prep: downloads ~6.5K parquet shards (400B tokens), trains BPE tokenizer, defines dataloader & evaluation |
+| [train.py](train.py) | ~680 | **Agent-editable.** Full GPT model architecture, MuonAdamW optimizer, training loop, hyperparameter defaults. Compiles to CUDA. |
+| [program.md](program.md) | ~220 | **Agent instructions.** Setup steps, experimentation loop rules, output format, results logging (TSV), termination conditions |
+| [analysis.ipynb](analysis.ipynb) | Notebook | Post-hoc analysis of `results.tsv` experiments (not in core loop) |
+| [pyproject.toml](pyproject.toml) | ~20 | Python package metadata & dependencies |
+| [.python-version](.python-version) | 1 | Python version pin (runtime) |
+| [uv.lock](uv.lock) | Large | Frozen dependency lockfile |
+| [progress.png](progress.png) | Image | Teaser showing training progression |
+
+**Total File Count:** ~11 files, extremely minimalist.
+
+---
+
+### **5. Agent Architecture**
+
+#### **Type: Single-Agent Closed Loop (No Sub-Agents)**
+
+The agent is **stateless** and **reactive**. It receives instructions in Markdown and produces code edits.
+
+#### **Main Agent Loop** (Defined in [program.md](program.md#L34-L78))
+
+```
+LOOP FOREVER:
+  1. Look at current git state / branch
+  2. Modify train.py with experimental idea (direct code editing)
+  3. git commit
+  4. Run: uv run train.py > run.log 2>&1
+  5. Parse results: grep "^val_bpb:\|^peak_vram_mb:" run.log
+  6. Read stack trace if crash: tail -n 50 run.log
+  7. Log result to results.tsv (NOT committed)
+  8. If val_bpb improved (lower): keep commit
+  9. If val_bpb ≤ baseline or crashed: git reset to prior commit
+  TERMINATE when: human manually stops (no automatic exit)
+```
+
+Source: [program.md](program.md#L64-L69):
+> *"Once the experiment loop has begun (after the initial setup), do NOT pause to ask the human if you should continue... You are autonomous. If you run out of ideas, think harder."*
+
+#### **State Management**
+
+| State Element | Storage | Format |
+|---------------|---------|--------|
+| **Model weights** | GPU VRAM + persisted via git diffs in `train.py` | Python source code |
+| **Optimization progress** | Transient in `optimizer.state` dict (not saved between runs) | Torch tensors in memory |
+| **Results history** | `results.tsv` (human-readable, untracked) | Tab-separated: `commit | val_bpb | memory_gb | status | description` |
+| **Experiment tracking** | Git branch + commit hash | `autoresearch/<tag>` branch; short SHA-7 in results.tsv ([program.md](program.md#L43)) |
+| **Tokenizer** | `~/.cache/autoresearch/tokenizer/` | pickle + PyTorch tensor |
+| **Data** | `~/.cache/autoresearch/data/` | Parquet shards (6543 max) |
+
+#### **Message & History Representation**
+
+- **Agent Input:** `program.md` (Markdown instruction doc)
+- **Agent Output:** Git commits + stdout metrics
+- **Conversation History:** None maintained (stateless per invocation)
+- **Context Window:** Agent reads full `program.md`, `prepare.py`, `train.py` each iteration (self-contained prompt)
+
+Source: [program.md](program.md#L11-L15):
+```markdown
+3. **Read the in-scope files**: The repo is small. Read these files for full context:
+   - `README.md` — repository context.
+   - `prepare.py` — fixed constants, data prep, tokenizer, dataloader, evaluation.
+   - `train.py` — the file you modify.
+```
+
+---
+
+### **6. LLM Provider Abstraction**
+
+**Provider Abstraction:** None. The repository is **tool-agnostic**.
+
+**How LLM Calls Are Made:**
+1. Agents are spun up **outside the repository** (Claude via VS Code, Codex, etc.)
+2. Agent reads `program.md` as a "super lightweight skill"
+3. Agent edits `train.py` and commits directly
+4. No LLM API calls inside Python code
+
+[README.md](README.md#L50-L54):
+```markdown
+## Running the agent
+
+Simply spin up your Claude/Codex or whatever you want in this repo 
+(and disable all permissions), then you can prompt something like:
+"Hi have a look at program.md and let's kick off a new experiment!"
+```
+
+**Provider Support:** Claude, GPT-4, or any LLM capable of understanding Markdown and Python.
+
+---
+
+### **7. Tool System**
+
+**Note:** There is **no tool system** in autoresearch. The agent does not invoke tools; it edits code and runs `uv run train.py`.
+
+**What the Agent CAN modify:**
+
+From [program.md](program.md#L37-L46):
+```markdown
+**What you CAN do:**
+- Modify `train.py` — this is the only file you edit.
+  Everything is fair game: model architecture, optimizer, hyperparameters, 
+  training loop, batch size, model size, etc.
+
+**What you CANNOT do:**
+- Modify `prepare.py`. It is read-only.
+- Install new packages or add dependencies.
+- Modify the evaluation harness.
+```
+
+**Observable Metrics** (not tool calls, but output metrics):
+From [program.md](program.md#L50-L66):
+```
+val_bpb:          0.997900     ← Primary metric (lower = better)
+training_seconds: 300.1
+total_seconds:    325.9
+peak_vram_mb:     45060.2
+mfu_percent:      39.80         ← Model FLOPs utilization
+total_tokens_M:   499.6
+num_steps:        953
+num_params_M:     50.3
+depth:            8
+```
+
+These are extracted via: [program.md](program.md#L60-L61):
+```bash
+grep "^val_bpb:" run.log
+grep "^val_bpb:\|^peak_vram_mb:" run.log
+```
+
+---
+
+### **8. Prompt / System Message Strategy**
+
+**Primary System Message:** [program.md](program.md#L1-L220) — a ~220-line Markdown document.
+
+#### **Structure of program.md:**
+
+| Section | Purpose |
+|---------|---------|
+| [Setup](program.md#L7-L27) | Branch creation, git workflow, file verification |
+| [Experimentation Rules](program.md#L30-L48) | Scope (train.py only), metric (val_bpb), time budget, VRAM soft constraints |
+| [Output Format](program.md#L50-L66) | What to extract from logs; grep patterns |
+| [Logging Results](program.md#L68-L88) | TSV format: commit, val_bpb, memory_gb, status, description |
+| [Experiment Loop](program.md#L90-L114) | LOOP FOREVER with crash handling; git reset logic; timeout rules |
+| [Never Stop Clause](program.md#L116-L122) | "do NOT pause to ask"; run 100 experiments while human sleeps |
+
+#### **Key Hyperparameter Prompt** (what agent can edit):
+
+From [train.py](train.py#L431-L446) — hyperparameters are **inline comments**:
+```python
+# Model architecture
+ASPECT_RATIO = 64       # model_dim = depth * ASPECT_RATIO
+HEAD_DIM = 128          # target head dimension for attention
+WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context
+
+# Optimization
+TOTAL_BATCH_SIZE = 2**19 # ~524K tokens per optimizer step
+EMBEDDING_LR = 0.6      # learning rate for token embeddings (Adam)
+UNEMBEDDING_LR = 0.004  # learning rate for lm_head (Adam)
+MATRIX_LR = 0.04        # learning rate for matrix parameters (Muon)
+SCALAR_LR = 0.5         # learning rate for per-layer scalars (Adam)
+WEIGHT_DECAY = 0.2      # cautious weight decay for Muon
+ADAM_BETAS = (0.8, 0.95) # Adam beta1, beta2
+WARMUP_RATIO = 0.0      # fraction of time budget for LR warmup
+WARMDOWN_RATIO = 0.5    # fraction of time budget for LR warmdown
+FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
+
+# Model size
+DEPTH = 8               # number of transformer layers
+DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
+```
+
+No CLI arguments; agent modifies constants directly.
+
+---
+
+### **9. Memory & Context Management**
+
+#### **Sequence Context (per forward pass)**
+- [train.py](train.py#L325): `MAX_SEQ_LEN = 2048` (from prepare.py import)
+- Architecture supports sliding window attention with alternating pattern `"SSSL"` ([train.py](train.py#L436))
+
+#### **Persistent Memory**
+- **Tokenizer cache:** `~/.cache/autoresearch/tokenizer/tokenizer.pkl` ([prepare.py](prepare.py#L42))
+- **Data cache:** `~/.cache/autoresearch/data/` (parquet shards)
+- **Experiment results:** `results.tsv` (human-tracked, not committed)
+
+#### **Context Management in Dataloader**
+
+From [prepare.py](prepare.py#L293-L347) — "BOS-aligned dataloader with best-fit packing":
+
+```python
+def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
+    """
+    BOS-aligned dataloader with best-fit packing.
+    Every row starts with BOS. Documents packed using best-fit to minimize cropping.
+    When no document fits remaining space, crops shortest doc to fill exactly.
+    100% utilization (no padding).
+    """
+```
+
+**Buffer Strategy:**
+- Pre-allocate CPU buffer (pin_memory=True) → GPU buffer
+- Best-fit document packing to avoid padding
+- Crop shortest doc to fill remaining space exactly
+
+#### **Attention Window Management**
+
+From [train.py](train.py#L180-L194) — Sliding window pattern:
+
+```python
+def _compute_window_sizes(self, config):
+    pattern = config.window_pattern.upper()  # e.g., "SSSL"
+    long_window = config.sequence_len       # 2048
+    short_window = long_window // 2         # 1024
+    char_to_window = {"L": (long_window, 0), "S": (short_window, 0)}
+    window_sizes = []
+    for layer_idx in range(config.n_layer):
+        char = pattern[layer_idx % len(pattern)]
+        window_sizes.append(char_to_window[char])
+    window_sizes[-1] = (long_window, 0)  # Always full context in last layer
+    return window_sizes
+```
+
+Pattern `"SSSL"` means: Layer 0=Short(1K), Layer 1=Short(1K), Layer 2=Short(1K), Layer 3=Long(2K), then repeat.
+
+---
+
+### **10. Planning Subsystem**
+
+**There is NO explicit planning subsystem.** 
+
+The agent uses **trial-and-error with git rollback**:
+- Form hypothesis (edit `train.py`)
+- Commit
+- Run 5-minute experiment
+- Evaluate result
+- If improved: **keep** commit (advance state)
+- If equal/worse: **revert commit** (discard)
+
+[program.md](program.md#L99-L105):
+```python
+If val_bpb improved (lower), you "advance" the branch, keeping the git commit
+If val_bpb is equal or worse, you git reset back to where you started
+
+The idea is that you are a completely autonomous researcher 
+trying things out. If they work, keep. If they don't, discard. 
+And you're advancing the branch so that you can iterate.
+```
+
+---
+
+### **11. Sub-Agents / Delegation**
+
+**None.** Single-agent architecture. No multi-agent coordination, hierarchical control, or delegated sub-tasks.
+
+The agent is **monolithic**:
+1. Single LLM instance
+2. Single training loop
+3. Single metric (val_bpb)
+4. No worker pools or task queues
+
+---
+
+### **12. Human-in-the-Loop**
+
+#### **Setup Phase (Human-Interactive)**
+[program.md](program.md#L7-L27):
+```markdown
+To set up a new experiment, work with the user to:
+1. Agree on a run tag: propose a tag based on today's date (e.g. `mar5`)
+2. Create the branch: `git checkout -b autoresearch/<tag>`
+3. Read the in-scope files: README.md, prepare.py, train.py
+4. Verify data exists: `~/.cache/autoresearch/`
+5. Initialize results.tsv
+6. Confirm and go
+```
+
+#### **Execution Phase (Fully Autonomous)**
+[program.md](program.md#L116-L122):
+```markdown
+**NEVER STOP**: Once the experiment loop has begun (after initial setup),
+do NOT pause to ask the human. The human might be asleep or gone.
+You are autonomous. Loop runs until the human manually interrupts.
+```
+
+#### **Review Phase (Post-Hoc)**
+- Human wakes up and reviews `results.tsv`
+- Human plots experiments via [analysis.ipynb](analysis.ipynb)
+- Human may adjust `program.md` for next batch
+
+#### **Kill Switch**
+Manual interruption only (Ctrl+C, or external termination).
+
+---
+
+### **13. Sandboxing / Safety**
+
+#### **Implicit Safety Mechanisms**
+
+| Mechanism | Implementation |
+|-----------|-----------------|
+| **Scope Restriction** | Agent can only edit `train.py`; `prepare.py` immutable ([program.md](program.md#L37-L46)) |
+| **No New Dependencies** | Cannot modify `pyproject.toml`; no pip install allowed |
+| **Single GPU** | Prevents distributed training complexity + accidental resource hoarding |
+| **Time Budget** | Exactly 300 seconds (5 min) wall-clock training [train.py](train.py#L602-L603); experiments timeout after 10 min |
+| **Fast Fail** | [train.py](train.py#L568-L571): Abort if loss NaN or > 100 |
+| **OOM Fallback** | If `train.py` crashes → log "crash" status, revert git commit |
+
+#### **Absence of Safety Features**
+- No sandboxed process isolation
+- No resource quotas (VRAM soft constraint only)
+- No code review before `git commit`
+- No test harness (agent can break things)
+- No adversarial prompt injection defense
+
+---
+
+### **14. Observability**
+
+#### **Logging Architecture**
+
+[train.py](train.py#L574-L589) — **Real-time progress logging**:
+
+```python
+print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | "
+      f"lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | "
+      f"mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s", 
+      end="", flush=True)
+```
+
+Output updates **per optimizer step** (~5-10s frequency on H100).
+
+#### **Metrics**
+
+| Metric | Definition | Computed Where |
+|--------|-----------|-----------------|
+| **val_bpb** | Bits per byte; vocab-size-independent ([prepare.py](prepare.py#L356-L377)) | `evaluate_bpb()` at end |
+| **training_seconds** | Wall-clock training time (300s target) | `total_training_time` in loop |
+| **peak_vram_mb** | Max GPU memory in MB | `torch.cuda.max_memory_allocated()` ([train.py](train.py#L618)) |
+| **mfu_percent** | Model FLOPs utilization; normalized to H100 peak (989.5e12) | Computed real-time ([train.py](train.py#L585)) |
+| **total_tokens_M** | Total tokens processed × 1e6 | `step * TOTAL_BATCH_SIZE` ([train.py](train.py#L605)) |
+
+#### **Results Persistence**
+
+[program.md](program.md#L68-L88):
+```
+commit	val_bpb	memory_gb	status	description
+a1b2c3d	0.997900	44.0	keep	baseline
+b2c3d4e	0.993200	44.2	keep	increase LR to 0.04
+c3d4e5f	1.005000	44.0	discard	switch to GeLU activation
+d4e5f6g	0.000000	0.0	crash	double model width (OOM)
+```
+
+Status values: `keep`, `discard`, `crash`
+
+#### **No Remote Telemetry**
+No integration with Weights & Biases, MLflow, or similar. All logging is local stdout + TSV.
+
+---
+
+### **15. Evaluation / Testing**
+
+#### **Primary Evaluation Metric**
+
+[prepare.py](prepare.py#L356-L377) — **Bits Per Byte (BPB)**:
+
+```python
+@torch.no_grad()
+def evaluate_bpb(model, tokenizer, batch_size):
+    """
+    Bits per byte (BPB): vocab size-independent evaluation metric.
+    Sums per-token cross-entropy (in nats), sums target byte lengths,
+    then converts nats/byte to bits/byte. Special tokens (byte length 0)
+    are excluded from both sums.
+    Uses fixed MAX_SEQ_LEN so results are comparable across configs.
+    """
+    token_bytes = get_token_bytes(device="cuda")
+    val_loader = make_dataloader(tokenizer, batch_size, MAX_SEQ_LEN, "val")
+    steps = EVAL_TOKENS // (batch_size * MAX_SEQ_LEN)
+    total_nats = 0.0
+    total_bytes = 0
+    for _ in range(steps):
+        x, y, _ = next(val_loader)
+        loss_flat = model(x, y, reduction='none').view(-1)
+        y_flat = y.view(-1)
+        nbytes = token_bytes[y_flat]
+        mask = nbytes > 0
+        total_nats += (loss_flat * mask).sum().item()
+        total_bytes += nbytes.sum().item()
+    return total_nats / (math.log(2) * total_bytes)
+```
+
+**Why BPB?**
+- **Vocab-size-independent**: Architectural changes don't unfairly penalize/favor larger vocabularies
+- **Byte-normalized**: Fairness across tokenizer choices
+- **Excludes special tokens**: Focus on actual text prediction
+
+#### **Validation Set**
+
+[prepare.py](prepare.py#L31-L39):
+```python
+EVAL_TOKENS = 40 * 524288  # 20.97M tokens for validation
+VAL_SHARD = MAX_SHARD      # Pinned shard 06542 (last shard)
+VAL_FILENAME = f"shard_{VAL_SHARD:05d}.parquet"
+```
+
+**Pinned validation set:** Same shard across all experiments (reproducibility).
+
+#### **No Unit Tests**
+No pytest, unittest, or test harness. Safety relies on agent trying ideas and discarding failures.
+
+#### **Quick Sanity Checks**
+
+[prepare.py](prepare.py#L222-L227) — Tokenizer roundtrip check:
+```python
+test = "Hello world! Numbers: 123. Unicode: 你好"
+encoded = enc.encode_ordinary(test)
+decoded = enc.decode(encoded)
+assert decoded == test, f"Tokenizer roundtrip failed: {test!r} -> {decoded!r}"
+print(f"Tokenizer: sanity check passed (vocab_size={enc.n_vocab})")
+```
+
+---
+
+### **16. Configuration**
+
+#### **Hyperparameter Configuration Strategy**
+
+**No configuration files.** All hyperparameters are **inline Python constants** in [train.py](train.py#L431-L446):
+
+```python
+# Model architecture
+ASPECT_RATIO = 64       # model_dim = depth * ASPECT_RATIO
+HEAD_DIM = 128
+WINDOW_PATTERN = "SSSL"
+
+# Optimization
+TOTAL_BATCH_SIZE = 2**19
+EMBEDDING_LR = 0.6
+UNEMBEDDING_LR = 0.004
+MATRIX_LR = 0.04
+SCALAR_LR = 0.5
+WEIGHT_DECAY = 0.2
+ADAM_BETAS = (0.8, 0.95)
+WARMUP_RATIO = 0.0
+WARMDOWN_RATIO = 0.5
+FINAL_LR_FRAC = 0.0
+
+# Model size
+DEPTH = 8
+DEVICE_BATCH_SIZE = 128
+```
+
+**Agent modifies these by editing the constants directly** (no CLI flags, no external config files).
+
+#### **Fixed Constants (Read-Only)**
+
+[prepare.py](prepare.py#L26-L41):
+```python
+MAX_SEQ_LEN = 2048       # context length
+TIME_BUDGET = 300        # training time budget in seconds (5 minutes)
+EVAL_TOKENS = 40 * 524288  # number of tokens for val eval
+VOCAB_SIZE = 8192
+```
+
+These are **immutable** to ensure fair experiment comparison.
+
+#### **Environment Variables**
+
+[train.py](train.py#L1-L5):
+```python
+import os
+os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+```
+
+Hard-coded; no user overrides.
+
+---
+
+### **17. Entry Points**
+
+#### **CLI Entry Points**
+
+1. **Data Preparation (one-time):**
+   ```bash
+   uv run prepare.py [--num-shards N] [--download-workers W]
+   ```
+   Source: [prepare.py](prepare.py#L393-L410)
+
+2. **Training (per experiment):**
+   ```bash
+   uv run train.py > run.log 2>&1
+   ```
+   Source: [program.md](program.md#L52)
+
+#### **No HTTP/API Endpoint**
+No web server, no RPC, no distributed setup.
+
+#### **Jupyter Analysis (Optional)**
+```bash
+jupyter notebook analysis.ipynb
+```
+Post-hoc analysis only; not in the core loop.
+
+---
+
+### **18. Notable Idioms & Patterns**
+
+#### **Karpathy's "From-Scratch" Minimalism**
+
+1. **Single-File Model** ([train.py](train.py#L26-L415))
+   - Full GPT implementation + optimizer + training loop in ONE file
+   - No separate `model.py`, `optimizer.py`, `train_loop.py`
+   - Entire architecture visible in one scroll through the file
+   - Pedagogical design: code is readable, not modular
+
+2. **No Frameworks Beyond PyTorch**
+   - No Lightning, Transformers, HuggingFace ecosystem
+   - Direct torch.nn.Module subclasses
+   - Raw tensor operations (no convenience abstractions)
+
+3. **Inline Hyperparameters**
+   - No YAML/JSON config; edit constants in source
+   - Forces agent to understand code structure
+   - Single git diff shows all parameter changes
+
+4. **Fixed Time Budget Model**
+   ```python
+   TIME_BUDGET = 300  # Always 5 minutes, regardless of platform
+   ```
+   [README.md](README.md#L38-L44):
+   > *"Seeing as there seems to be a lot of interest in tinkering with autoresearch on much smaller compute platforms than an H100, a few extra words. If you're going to try running autoresearch on smaller computers (Macbooks etc.), I'd recommend one of the forks below."*
+   
+   Platform-agnostic results via time normalization.
+
+5. **Value Residual (ResFormer) Innovation**
+   [train.py](train.py#L80-L88):
+   ```python
+   def has_ve(layer_idx, n_layer):
+       """Returns True if layer should have Value Embedding (alternating)."""
+       return layer_idx % 2 == (n_layer - 1) % 2
+   ```
+   Alternating value embeddings with learnable gates; non-standard architecture.
+
+6. **Per-Layer Residual Scalars** [train.py](train.py#L145-L146):
+   ```python
+   self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
+   self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))
+   ```
+   Each layer learns how much to mix fresh computation vs. skip connection to input.
+
+7. **MuonAdamW Hybrid Optimizer** [train.py](train.py#L307-L486)
+   - Muon (orthogonalization-based) for 2D matrices
+   - AdamW for embeddings & scalars
+   - Single unified optimizer with param group routing
+
+#### **Pedagogical Patterns**
+
+- **Clear Comments:** Every class/function has docstring or inline comment explaining intent
+- **Explicit Initializations:** [train.py](train.py#L105-L148) shows detailed weight initialization rationale
+- **Readable Variable Names:** `smooth_train_loss`, `debiased_smooth_loss`, `mfu` (model FLOPs utilization)
+- **Progress Visualization:** Real-time \r-overwrites with % completion ([train.py](train.py#L574))
+
+---
+
+### **19. Data Flow Diagram (End-to-End Textual Trace)**
+
+#### **One Experiment Run Lifecycle**
+
+```
+Agent (outside repo)
+  │
+  └─→ Read program.md, prepare.py, train.py
+        │
+        ├─→ Edit train.py: change DEPTH, LR, etc.
+        │
+        └─→ git add train.py && git commit -m "..."
+              │
+              └─→ [train.py executes]
+                    │
+                    ├─→ Initialize model GPT(config) from DEPTH, ASPECT_RATIO
+                    │     └─→ Load tokenizer from ~/.cache/autoresearch/
+                    │
+                    ├─→ Compile model: torch.compile(model)
+                    │
+                    ├─→ Setup optimizer:
+                    │     ├─→ MuonAdamW param groups
+                    │     ├─→ Muon for transformer matrices
+                    │     └─→ AdamW for embeddings, scalars
+                    │
+                    ├─→ Load train dataloader:
+                    │     ├─→ Read parquet shards (all except val_shard_06542)
+                    │     ├─→ Encode docs with BOS token
+                    │     ├─→ Best-fit packing (100% utilization, no padding)
+                    │     └─→ Stream to GPU (pre-allocated buffers)
+                    │
+                    ├─→ Training loop (while total_training_time < 300s):
+                    │     ├─→ For each optimizer step:
+                    │     │   ├─→ Micro-steps (gradient accumulation)
+                    │     │   │   ├─→ model(x, y) → cross-entropy loss
+                    │     │   │   └─→ loss.backward() (accumulate grads)
+                    │     │   │
+                    │     │   ├─→ Schedule LR based on progress (warmup/warmdown)
+                    │     │   ├─→ Update optimizer learning rates
+                    │     │   ├─→ optimizer.step() [Muon + AdamW dispatch]
+                    │     │   ├─→ model.zero_grad()
+                    │     │   │
+                    │     │   ├─→ Log: step, loss, lrm, dt, tok/sec, mfu%, epoch
+                    │     │   │
+                    │     │   └─→ Break if step > 10 AND total_training_time >= 300s
+                    │     │
+                    │     └─→ (If loss NaN or > 100: FAIL and exit(1))
+                    │
+                    ├─→ Final evaluation (val_bpb):
+                    │     ├─→ Load val dataloader (shard_06542 only)
+                    │     ├─→ For each eval batch:
+                    │     │   ├─→ Forward pass
+                    │     │   ├─→ Compute per-token cross-entropy (nats)
+                    │     │   └─→ Lookup byte lengths from token_bytes.pt
+                    │     ├─→ Sum nats & bytes across eval set (40M tokens)
+                    │     └─→ BPB = total_nats / (ln(2) * total_bytes)
+                    │
+                    └─→ Print summary:
+                          val_bpb: 0.997900
+                          training_seconds: 300.1
+                          peak_vram_mb: 45060.2
+                          mfu_percent: 39.80
+                          ... (8 more fields)
+                              │
+                              └─→ Output to stdout + captured in run.log
+                                    │
+Agent (outside repo) reads stdout
+  │
+  ├─→ grep "^val_bpb:\|^peak_vram_mb:" run.log
+  │     └─→ Extract: val_bpb=0.9979, peak_vram=45060.2
+  │
+  ├─→ Compare to baseline (first run)
+  │
+  ├─→ Log to results.tsv:
+  │     commit | val_bpb | memory_gb | status | description
+  │     a1b2c3d | 0.9979 | 45.0 | [keep/discard/crash] | [reason]
+  │
+  └─→ Decision:
+      ├─ If val_bpb < baseline: git stays (branch advances)
+      └─ If val_bpb ≥ baseline: git reset --hard HEAD~1 (revert)
+           │
+           └─→ Loop back to editing train.py again
+```
+
+**Time Budget Enforcement:**
+
+[train.py](train.py#L602-L604):
+```python
+if step > 10 and total_training_time >= TIME_BUDGET:
+    break
+```
+
+Clock starts after 10 warmup steps to exclude compilation overhead.
+
+---
+
+### **20. Weaknesses / Gaps**
+
+#### **Architectural Gaps**
+
+| Gap | Impact | Reason |
+|-----|--------|--------|
+| **No multi-agent orchestration** | Single agent can't explore design space in parallel | Minimalism; single GPU constraint |
+| **No learned agent policy** | Agent uses cold LLM context every step (no RL-based improvement) | Tool-agnostic design; Karpathy intends "human-written program.md" optimization |
+| **No curriculum learning** | Experiment sequence is random, not adaptive | Agent has no feedback loop beyond val_bpb |
+| **No hyperparameter sensitivity analysis** | Difficult to understand which changes matter | No variance reduction; single val set |
+| **No checkpointing** | Training aborted at 300s; can't resume mid-experiment | Intentional: fixed time budget = reproducible platform-agnostic results |
+| **No meta-learning across runs** | Each run starts from scratch (no transfer) | Tokenizer is fixed; model weights reset; only code changes persist via git |
+
+#### **Implementation Weaknesses**
+
+| Weakness | Issue | Source |
+|----------|-------|--------|
+| **Gradient accumulation bug risk** | Agent could break `grad_accum_steps` calculation by changing `TOTAL_BATCH_SIZE` or `MAX_SEQ_LEN` without proportional model changes | [train.py](train.py#L463-L465): `assert TOTAL_BATCH_SIZE % tokens_per_fwdbwd == 0` can fail silently if agent edits wrong constant |
+| **No git history cleanup** | After 100 experiments, branch has 100 commits; difficult to cherry-pick useful changes | git reset doesn't clean dangling commits; no squash/rebase automation |
+| **VRAM is "soft" constraint** | Agent can easily OOM by increasing model depth; crash = "discard" but OOM might persist across attempts | [prepare.py](prepare.py#L356): Only evaluates on 40M tokens; may miss VRAM overages on larger val sets |
+| **No LR schedule cross-validation** | Warmup/warmdown ratios are global; no per-layer scheduling | [train.py](train.py#L537-L551): Fixed schedules; agent must brute-force |
+| **Flash Attention 3 GPU hard constraint** | Only works on Hopper+ (H100). Non-Hopper GPUs need kernels-community fallback | [train.py](train.py#L17-L19): Repo defaults to varunneal/flash-attention-3 but requires runtime detection |
+| **Tokenizer is fixed** | Agent can't experiment with vocab size or tokenization strategy | [prepare.py](prepare.py#L38): VOCAB_SIZE=8192 hardcoded; BPE pattern fixed |
+
+#### **Operational Gaps**
+
+| Gap | Issue |
+|-----|-------|
+| **No crash recovery** | If OOM kills training mid-epoch, next run starts over without resuming | Intentional for simplicity |
+| **No divergence detection** | Loss spikes > 100 hard-abort; no soft fail to reduce LR and retry | Fast fail is crude but prevents hanging |
+| **No experiment deduplication** | Agent might accidentally test same hyperparams twice | Only human can spot in results.tsv |
+| **TSV merge conflicts** | If two agents run in parallel, results.tsv merges can be messy | No distributed coordination |
+
+#### **Design Constraints (Intentional)**
+
+These aren't weaknesses but deliberate choices:
+
+1. **Single File to Edit** — Keeps agent scope small; prevents systemic breakage
+2. **No External Dependencies** — Reproducibility; no transitive deps to break
+3. **No Distributed Training** — Keeps code simple; single GPU works on any HW
+4. **Fixed Time Budget** — Platform-agnostic comparisons
+5. **No Config Files** — Forces agent to engage with code structure
+
+---
+
+## **Summary**
+
+**autoresearch** is a **minimalist, pedagogical autonomous LLM training experiment platform**. It exemplifies Karpathy's philosophy of "from-scratch" simplicity:
+
+- **37 KB of Python** in three files (prepare.py, train.py)
+- **One hyperparameter space:** ~20 editable constants
+- **One metric:** vocabulary-independent bits-per-byte
+- **One loop:** edit, commit, train 5 min, evaluate, keep/discard
+- **No frameworks, no abstractions, no distributed complexity**
+
+The agent is **completely stateless** — it receives Markdown instructions (`program.md`), edits Python code (`train.py`), runs experiments via CLI, and logs results to a TSV. All architecture decisions are **embedded in code comments and docstrings**, making it naturally readable and modifiable by LLMs.
+
+**Key architectural insight:** This is **not an agent framework** (no tool calling, no LLM API integration). It's a **training harness designed for agent-directed experimental iteration**, where the agent's "tools" are Git commits and stdout parsing.

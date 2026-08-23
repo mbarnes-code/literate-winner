@@ -1,0 +1,918 @@
+Now let me compile my findings into a comprehensive analysis report.
+
+## THOROUGH ARCHITECTURAL ANALYSIS: Hermes Agent
+
+---
+
+### **1. Project Identity & Purpose**
+
+**File:** [README.md](README.md#L1)
+
+**What it is:** Hermes Agent is **Nous Research's self-improving AI agent** — not just Hermes model tooling, but a complete **agentic harness** for orchestrating autonomous agent workflows. It is a production-grade, multi-platform agent runtime designed for long-lived deployments.
+
+**Problem domain:** 
+- Autonomous task execution with tool calling and iterative reasoning
+- Persistent learning across sessions (skills, memory)
+- Multi-platform deployment (CLI, Telegram, Discord, Slack, WhatsApp, Signal, web UI, desktop)
+- Reduced API costs via prompt-prefix caching
+- Distributed execution (subagents, scheduled jobs, serverless environments)
+
+**Key differentiator:** The only agent with a **"closed learning loop"** — it creates and improves skills autonomously during use, maintains session-searchable history with LLM summarization, and models user preferences (Honcho dialectic) across sessions.
+
+---
+
+### **2. Languages & Runtime**
+
+- **Primary language:** Python 3.11–3.13 (exact-pinned; see [pyproject.toml line 10](pyproject.toml#L10): `requires-python = ">=3.11,<3.14"`)
+- **Frontend:** TypeScript/Node.js 22+ (TUI, desktop Electron, web dashboard)
+- **Protocols:** OpenAI-compatible Chat Completions + ChatGPT Codex Responses API
+- **Terminals:** Seven backends (local, Docker, SSH, Singularity, Modal, Daytona, Vercel Sandbox)
+
+---
+
+### **3. Dependencies**
+
+**Direct production dependencies (core):** [pyproject.toml, lines 23–110](pyproject.toml#L23-L110)
+
+| Category | Key Dependencies |
+|----------|------------------|
+| **LLM SDKs** | `openai==2.24.0` (primary); lazy-loaded: `anthropic==0.87.0`, provider-specific SDK stubs |
+| **Agent runtime** | `nemo-relay>=0.7.1` (native SDK adapter for Nous/Relay), `prompt_toolkit==3.0.52` (TUI REPL) |
+| **Tool/observability** | `tenacity==9.1.4` (retries), `httpx[socks]==0.28.1` (HTTP), `websockets==15.0.1` (browser CDP) |
+| **Config** | `pyyaml==6.0.3`, `ruamel.yaml==0.18.17`, `jinja2==3.1.6` |
+| **Data** | `pydantic==2.13.4` (schemas), `Markdown==3.10.2` (rendering), `Pillow==12.3.0` (image resize) |
+| **Scheduling** | `croniter==6.0.0` (cron jobs) |
+| **Async** | `ptyprocess`, `pywinpty` (cross-platform PTY), `uvicorn[standard]`, `fastapi` (gateway) |
+| **Auth** | `PyJWT[crypto]==2.13.0` (GitHub App / Skills Hub) |
+| **Security** | `cryptography==50.0.0`, `certifi`, `urllib3>=2.7.0` |
+| **Windows-specific** | `pywin32`, `concurrent-log-handler` |
+
+**Provider backends (lazy-installed via [tools/lazy_deps.py](tools/lazy_deps.py)):**
+- Anthropic, xAI, Qwen, Gemini, Bedrock, Azure OpenAI, GitHub Copilot, OpenRouter, LM Studio, Vertex AI, Moonshot, Together, vLLM, Ollama, LiteLLM
+- Web search: Exa, Firecrawl, Parallel Web
+- Image gen: FAL (FLUX), ElevenLabs, OpenAI DALL-E
+- TTS: Edge-TTS (free default), ElevenLabs, MiniMax
+- Video: BFL FLUX3 (text/image/keyframe to video)
+- Memory: Honcho (dialectic), Hindsight, Mem0, Supermemory
+- Messaging: Telegram, Discord, Slack, Matrix, WeChat, Weixin (via webhook)
+- Cloud: Modal (serverless), Daytona, Vercel Sandbox
+
+---
+
+### **4. Top-Level Directory Layout**
+
+| Directory | Purpose |
+|-----------|---------|
+| [agent/](agent/) | **Core agent loop & orchestration** — conversation_loop.py (~3900 lines), system_prompt.py, memory_provider.py, tool_executor.py, context_compressor.py, chat_completion_helpers.py, error_classifier.py. Where tool-calling iteration happens. |
+| [tools/](tools/) | **Self-registering tool modules** — 50+ tools (terminal, browser, web_search, vision, code_execute, delegate_task, memory, skills, etc.). registry.py coordinates discovery. |
+| [cli.py](cli.py) | **Interactive TUI entry point** — prompt_toolkit REPL with autocomplete, streaming, tool progress overlay. Multiplexes input/output with the gateway. |
+| [run_agent.py](run_agent.py) | **AIAgent class & main loop orchestrator** (~5000 lines). Imports from agent/ for modularity. Public API: `AIAgent(model, provider, ...).run_conversation(user_text)`. |
+| [hermes_cli/](hermes_cli/) | **CLI command routing** — main.py, config loader, setup wizard, model selector, profiles manager. Entry: `hermes`, `hermes gateway`, `hermes setup`, etc. |
+| [gateway/](gateway/) | **Multi-platform message gateway** — Telegram, Discord, Slack, Matrix, WhatsApp, Signal adapters. Single process handles all 7 channels; routes to shared AIAgent instance. |
+| [ui-tui/](ui-tui/) | **Electron desktop TUI** — Node.js frontend talks to local Hermes process via stdio/WebSocket. Pairs a GUI chat sidebar with an embedded terminal pane. |
+| [web/](web/) | **Dashboard & web UI** — session browser, file manager, model/config editor, streaming WebSocket for remote Hermes. |
+| [skills/](skills/) | **Autonomous skill bundles** — YAML files organized by domain (github, devops, mlops, etc.). Agent-curated during complex tasks. Compatible with [agentskills.io](http://agentskills.io). |
+| [providers/](providers/) | **LLM provider abstraction** (base.py) — plugin system for new providers (unused in current core, for extensibility). |
+| [acp_adapter/](acp_adapter/) | **VS Code ACP (Adaptive Code Protocol) server** — allows Copilot Chat → Hermes → VS Code bidirectional. |
+| [native/](native/) | **Platform-specific bindings** — Windows PTY bridge (pywinpty wrapper), shell integration hooks. |
+| [evals/](evals/) | **Batch evaluation & trajectory collection** — for training agentic models on Hermes traces. |
+| [plugins/](plugins/) | **User-facing extensions** — memory providers, system-prompt sections, observability hooks. Loaded dynamically. |
+| [hermes_state.py](hermes_state.py), [hermes_state_*.py](hermes_state_*.py) | **SQLite session persistence** — conversation history, state checkpoints, durable message storage. One DB per profile (~/.hermes/state.db). |
+| [model_tools.py](model_tools.py) | **Tool registry orchestrator** — thin layer over tools/registry.py. Public API: `get_tool_definitions(enabled_toolsets, ...)`, `handle_function_call(name, args)`. |
+| [hermes](hermes) | **Shell wrapper script** — invokes Python CLI with venv activation, entrypoint for `hermes` command. |
+| [batch_runner.py](batch_runner.py) | **Trajectory batch generator** — spawns N parallel AIAgent instances to generate training data for model fine-tuning. |
+| [cron/](cron/) | **Scheduled job system** — croniter-driven task runner; jobs can be triggered from Telegram/CLI and write results back to chat platforms. |
+
+---
+
+### **5. Agent Architecture**
+
+#### **5.1 Main Agent Loop**
+
+**Location:** [agent/conversation_loop.py](agent/conversation_loop.py#L1) (~3900 lines extracted from run_agent.py)
+
+**Signature:** `AIAgent.run_conversation(user_text: str, **kwargs) -> str`
+
+The loop (simplified flow):
+```
+1. Build turn context (sanitize user input, fetch memory, resolve working dir)
+2. Compress history if context > threshold (optional, configurable)
+3. Build system prompt (identity + context files + skills + memory)
+4. Call LLM API in a loop until convergence:
+   a. POST /chat/completions (or /v1/responses for Codex)
+   b. Parse tool_calls from response
+   c. Dispatch tool batch (sequential or parallel, up to 8 workers)
+   d. Collect tool results → append to messages
+   e. If finish_reason == "tool_calls", loop back to 4a
+   f. Else (stop/length): finalize and exit
+5. Post-turn: flush to SQLite, update memory, background skill review
+6. Return final_response (user-facing text)
+```
+
+**Architecture style:** **ReAct-style with tool parallelization**
+- Each LLM response can contain N tool calls (array `tool_calls: [{id, function, arguments}]`)
+- Tool calls are **parallel-safe** (concurrent.futures) by path overlap detection
+- Tool results loop back without injecting synthesis — raw model iteration
+
+#### **5.2 Multi-Agent (Subagents / Delegation)**
+
+**Location:** [tools/delegate_tool.py](tools/delegate_tool.py#L1), [agent/subagent_lifecycle.py](agent/subagent_lifecycle.py)
+
+**Pattern:** **Parent-child flat architecture, single-generation nesting by default**
+- Parent spawns child(ren) via `delegate_task(goal, context, parallelism)` tool call
+- Each child gets a **fresh conversation** (no parent history visible)
+- Child toolset = parent toolset minus blocked tools (`delegate_task`, `clarify`, `memory`, `send_message`, `cronjob`)
+- Child task runs in ThreadPoolExecutor worker with inherited stdio/credential context
+- Parent sees only **summary result**, not intermediate tool calls
+- **Max depth:** 1 by default (flat); configurable via `delegation.max_spawn_depth` config
+
+**State tracking:** [_active_subagents](tools/delegate_tool.py#L120) registry + [_recent_subagents](tools/delegate_tool.py#L130) FIFO (200-entry cap for background process attribution)
+
+#### **5.3 Single-Agent vs Multi-Agent Decision**
+
+- **Single-agent (default):** User talks to main AIAgent; agent handles all tools directly
+- **Multi-agent (via delegate_task):** Parent orchestrates specialized children for parallel workstreams (e.g., "fetch docs + write code + deploy in parallel")
+- **Orchestrator pattern:** A child spawned with `role='orchestrator'` can spawn its own children (max depth control)
+
+#### **5.4 State Management**
+
+**In-memory (per-session AIAgent instance):**
+- `self.messages: list[dict]` — mutable conversation live buffer
+- `self._cached_system_prompt: str` — built once per session, reused across turns
+- `self.session_*_tokens: int` — token counters (input, output, cache read/write, reasoning)
+- `self._session_db: SessionDB` — open SQLite handle for this profile
+
+**Durable (SQLite at ~/.hermes/state.db):**
+- `conversations` table: session_id, model, model_config, source, created_at, etc.
+- `messages` table: session_id, role (system/user/assistant/tool), content, tool_calls, metadata
+- `memory_bank` table: session_id, content, tags, created_at (user memory notes)
+- Append-only: never overwrite; compression defragments in-place via `_DB_PERSISTED_MARKER` + micro-compaction
+
+**Ephemeral scaffolding (never persisted):**
+- `_empty_recovery_synthetic` — artificial "(empty)" turn injected after provider returned nothing
+- `_verification_stop_synthetic` — nudge to verify completion
+- `_dropped_toolcall_nudge` — "issue the tool call now" internal retry instruction
+
+See [run_agent.py lines 248–282](run_agent.py#L248-L282) for full ephemeral marker list.
+
+#### **5.5 Message/History Representation**
+
+**Format:** OpenAI Chat Completions schema (list of role/content dicts)
+
+```json
+{
+  "role": "user|assistant|system|tool",
+  "content": "string | array of content blocks",
+  "tool_calls": [
+    {"id": "call_123", "function": {"name": "terminal", "arguments": "{\"cmd\": \"ls\"}"}}
+  ],
+  "tool_call_id": "call_123",  // present on tool results only
+  "display_kind": "hidden",  // internal: hide from user display
+  "api_content": "...",  // sidecar for provider replay (internal scaffolding)
+  "_db_persisted": true,  // marker: written to SQLite
+  "timestamp": 1698765432.5
+}
+```
+
+**Function-calling format native to OpenAI SDK:**
+- Tool schema passed as `tools: [{type: "function", function: {name, description, parameters (JSON schema)}}]`
+- Model returns `finish_reason: "tool_calls"` + `tool_calls` array
+- **Not XML-based** — Hermes follows OpenAI's native JSON function-calling format
+- Multi-hop: model can return N tool_calls in one response; agent parallelizes, collects all results, loops back
+
+---
+
+### **6. LLM Provider Abstraction**
+
+**Architecture:** **Provider-agnostic OpenAI-compatible wire format** + per-provider adapter layer
+
+**Entry point:** [AIAgent.__init__](run_agent.py#L1370)
+
+**Resolution order:**
+1. User specifies `provider` (string: "openai", "anthropic", "xai", "custom", etc.) + `base_url` + `api_key`
+2. AIAgent looks up provider in [hermes_cli/models.py](hermes_cli/models.py) — resolves to endpoint metadata
+3. Lazy-loads provider SDK if native (e.g., `anthropic` → `from anthropic import Anthropic`)
+4. Wraps SDK in `OpenAI`-compatible client via [agent/process_bootstrap.py::_create_openai_client](agent/process_bootstrap.py#L1)
+5. Provider-specific adapters in [agent/](agent/) prefixed by provider: `anthropic_adapter.py`, `bedrock_adapter.py`, `gemini_native_adapter.py`, `vertex_adapter.py`, `relay_runtime.py` (for Nous Relay)
+6. All API calls routed through standardized chat-completions path in [agent/chat_completion_helpers.py](agent/chat_completion_helpers.py#L1)
+
+**Codex Responses API:** For GPT-5.x models, [agent/codex_responses_adapter.py](agent/codex_responses_adapter.py) switches to `/v1/responses` (streaming-only, higher quality function calling)
+
+**Fallback chain:** [agent/agent_runtime_helpers.py::try_activate_fallback](agent/agent_runtime_helpers.py)
+- Primary model fails (429 rate limit, 400 bad request, 500 server error)
+- Rotate to next in `fallback_model` config + credential pool if multi-account
+- Rate-limit cooldown: 60s; other failures: 5s
+
+**Supported providers natively:**
+- Direct: OpenAI, Anthropic, xAI, Google Gemini, Azure OpenAI, Bedrock, Vertex, Qwen, Moonshot, Together, Nous (Relay), LM Studio, Ollama, vLLM, LiteLLM
+- Via OpenRouter: 300+ models
+- Custom: any OpenAI-compatible `/v1/chat/completions` endpoint
+
+---
+
+### **7. Tool System**
+
+#### **7.1 Tool Definitions & Registry**
+
+**Location:** [tools/registry.py](tools/registry.py#L1)
+
+**Pattern:** Self-registering modules
+- Each tool file (e.g., [tools/terminal_tool.py](tools/terminal_tool.py)) calls `registry.register(...)` at module level
+- [tools/registry.py::discover_builtin_tools](tools/registry.py#L85) scans `.py` files via AST to find `registry.register(...)` calls (avoids importing all tools at startup)
+- Results cached in `~/.hermes/cache/tool_discovery_cache.json` (key: mtime_ns + size)
+
+**Registration signature:**
+```python
+registry.register(
+    name="terminal",
+    description="Execute shell commands",
+    parameters={...},  # JSON schema for LLM
+    handler=execute_terminal,  # callable(function_args: dict, **context) -> str
+    toolsets=["terminal", "core"],  # which toolsets include this tool
+    check_fn=check_terminal_available,  # optional: availability gate
+)
+```
+
+#### **7.2 Built-in Tools (70+ core)**
+
+**Organized by [toolsets.py](toolsets.py#L1):**
+
+| Toolset | Tools | Purpose |
+|---------|-------|---------|
+| `web` | web_search, web_extract, x_search | Internet research |
+| `vision` | vision_analyze | Image/screenshot analysis |
+| `image_gen` | image_generate, bfl_flux3_* | Creative generation |
+| `terminal` | terminal, process | Shell execution |
+| `file` | read_file, write_file, patch, search_files | File I/O |
+| `browser` | browser_navigate, browser_click, browser_snapshot, browser_cdp, browser_dialog | Browser automation (Playwright) |
+| `code` | execute_code | Python/JavaScript execution |
+| `skills` | skills_list, skill_view, skill_manage | Skill CRUD |
+| `delegation` | delegate_task | Spawn subagents |
+| `planning` | todo, memory | Notes & persistent state |
+| `kanban` | kanban_show, kanban_complete, kanban_block, ... | Multi-agent coordination |
+| `cron` | cronjob | Schedule background work |
+| `tts` | text_to_speech | Speech synthesis |
+| `discord`, `telegram`, `slack` | Various channel-specific | Cross-platform messaging |
+| `ha_*` | Home Assistant integration | Smart home control |
+| `computer_use` | Computer vision + mouse/keyboard | Desktop automation (macOS) |
+
+#### **7.3 Tool Execution (Dispatch & Parallelization)**
+
+**Location:** [agent/tool_executor.py](agent/tool_executor.py#L1)
+
+**Sequential vs parallel:**
+- Default: **parallel** (up to 8 workers) if tool calls don't overlap on file paths
+- [_should_parallelize_tool_batch](agent/tool_dispatch_helpers.py): checks path overlap, destructiveness (`rm`, `git push`), start order (approvals must serialize)
+- Destructive tools: terminal commands matching `rm|rm -rf|git push|git force-push` → sequential even if safe
+- Image generation: max 4 concurrent (FAL rate limit)
+
+**Result handling:**
+- Tool result = string (JSON for structured tools, plain text for shell)
+- Oversized results (>100KB): spilled to `~/.hermes/sessions/{session_id}/{tool_name}.output`
+- Injected as `{"role": "tool", "tool_call_id": "call_123", "content": "..."}`
+
+#### **7.4 Tool Guardrails & Approval**
+
+**Location:** [agent/tool_guardrails.py](agent/tool_guardrails.py), [tools/approval.py](tools/approval.py)
+
+**Dangerous-command whitelist:**
+- `file_mutating_commands`: rm, dd, git push, mv out-of-project
+- `approval_required`: confirmed by CLI interactively or gateway queue
+- Subagents auto-deny by default (safe) or auto-approve (opt-in via `delegation.subagent_auto_approve: true`)
+
+**Sandboxing (per-terminal-backend):**
+- Local: native shell (no isolation)
+- Docker: spawn container per task_id, ephemeral volume mounts
+- SSH: remote execution on provisioned host
+- Modal/Daytona/Vercel: serverless function invocation
+
+---
+
+### **8. Prompt / System Message Strategy**
+
+**Location:** [agent/system_prompt.py](agent/system_prompt.py#L1), [agent/prompt_builder.py](agent/prompt_builder.py#L1)
+
+**Three-tier assembly (joined with `\n\n`):**
+
+**Tier 1: Stable** (byte-stable for cache)
+- Identity: [DEFAULT_AGENT_IDENTITY](agent/prompt_builder.py#L236)
+  ```
+  You are Hermes Agent, an intelligent AI assistant created by Nous Research. 
+  You are helpful, knowledgeable, and direct...
+  ```
+- Tool guidance: "Here is how to use your tools: function calling via JSON schema..."
+- Computer use guidance (if enabled)
+- Subscription block (Nous Portal benefits)
+- Tool-use enforcement (per-model: "Always call tools, never describe hypothetically")
+- Environment hints (shell type, OS, Python version, working directory)
+- Platform hints (CLI: "You are in an interactive terminal"; Telegram: "Messages limited to 4096 chars")
+- Coding guidance: "When writing code, prefer clear variable names..."
+- Hermes help reference: "For Hermes configuration/setup questions, see https://hermes-agent.nousresearch.com/docs"
+
+**Tier 2: Context** (mutable but long-lived)
+- Caller-supplied `system_message` kwarg
+- Discovered context files (in order of resolution):
+  - `.hermes.md` / `HERMES.md` (project-specific directives)
+  - `AGENTS.md` (team-level, discovered in git root)
+  - `.cursorrules` (Cursor IDE compatibility)
+  - `SOUL.md` (user identity, replaces DEFAULT_AGENT_IDENTITY if present)
+- Coding-workspace snapshot (project structure, dependencies, last N errors from CI)
+- Threat scanning: injection patterns blocked; benign content scanned once
+
+**Tier 3: Volatile** (rebuilt every turn)
+- Skills index: available skill names + one-line descriptions
+- Memory snapshot (if external memory provider enabled)
+- USER.md profile (user preferences, recurring corrections)
+- External memory provider block (e.g., Honcho dialectic context)
+- Timestamp / session_id / model / provider line
+
+**Example system prompt fragment (actual text):**
+```
+You are Hermes Agent, an intelligent AI assistant created by Nous Research...
+
+## Environment
+- OS: linux
+- Shell: bash
+- Python: 3.11.9
+- Working directory: /home/user/myproject
+
+## Skills Available
+- github_ci_fix (debug GitHub Actions failures)
+- typescript_types (write TypeScript type definitions)
+- docker_troubleshoot (diagnose Docker container issues)
+
+## Memory
+- User prefers concise responses
+- Project uses pnpm workspaces
+- Recent: Fixed eslint config parsing bug
+
+## User Profile (USER.md)
+Name: Alex
+Role: Full-stack engineer
+Timezone: America/New_York
+Preferences: [concise, direct, code-first]
+
+Conversation started: 2026-08-23 14:35:22 UTC
+Session: abc123def456
+Model: claude-opus-4
+Provider: anthropic
+```
+
+**Cache-safety invariants:**
+- Stable tier is byte-for-byte identical across turns (same model/provider)
+- No mid-conversation prompt mutation (would invalidate prefix cache)
+- Compression rebuilds stable tier only once, reusing cached prefix
+
+---
+
+### **9. Memory & Context Management**
+
+#### **9.1 In-Session Memory (SQLite)**
+
+**Location:** [hermes_state.py](hermes_state.py)
+
+- Per-profile DB at `~/.hermes/state.db`
+- `memory_bank` table: user-written facts (via `memory` tool)
+- Target: `"user"` (USER.md profile) or `"memory"` (MEMORY.md session notes)
+- Guidance in [prompt_builder.py::MEMORY_GUIDANCE](agent/prompt_builder.py#L260):
+  - Write **facts**, not procedures ("User prefers X" ✓, "Always do X" ✗)
+  - Avoid task progress, PR numbers, commit SHAs (stale in 7 days)
+  - Skills for workflows; memory for preferences
+
+#### **9.2 Cross-Session Memory (Pluggable Providers)**
+
+**Location:** [agent/memory_provider.py](agent/memory_provider.py#L1)
+
+**Abstract base class:** MemoryProvider
+- `is_available()` — check credentials, installed dependencies
+- `initialize(session_id, **kwargs)` — connect, create resources
+- `prefetch(user_query)` — background recall before each turn
+- `sync_turn(user_msg, assistant_msg)` — async write after each turn
+- `get_tool_schemas()` — tool definitions to expose
+- `handle_tool_call(name, args)` — dispatch memory tool call
+
+**Built-in:** Local MEMORY.md file (plain text, searchable via grep)
+
+**Plugins (lazy-installed):**
+- **Honcho** ([hindsight-client](pyproject.toml#L83)): Dialectic reasoning (peer names, reasoning levels), cross-session user modeling
+- **Hindsight**: Vector DB-backed semantic recall
+- **Mem0**: Third-party memory as a service
+- **Supermemory**: Cloud-backed knowledge base
+
+**Prefetch gate:** [is_trivial_prompt](agent/memory_provider.py#L54)
+- Skips memory lookups for one-word replies, greetings, slash commands
+- Regex: `^(yes|no|ok|thanks|hi|hey|continue|go ahead|...)`
+
+---
+
+### **10. Planning Subsystem**
+
+**Not a separate planner — reactive + learned skills**
+
+**Planning mechanisms:**
+
+1. **Skills (learned workflows):** After complex 5+ tool-call tasks, agent saves approach as YAML skill for reuse
+2. **Kanban tasks:** Asynchronous work queues ([tools/kanban_tools.py](tools/kanban_tools.py)) — spawns worker agents to process tasks from shared SQLite board
+3. **Cron jobs:** Natural-language-to-cron ([cron/](cron/)) — "every Monday at 9am, run my weekly report" → persisted job
+4. **Todo tool:** Persistent checklist in session
+5. **Scratch space:** Memory tool for mid-task notes
+
+**No explicit POMDP or tree search** — relies on model's chain-of-thought + ReAct loop with tools
+
+---
+
+### **11. Sub-Agents / Delegation**
+
+**Already covered in Section 5.2 — see above for full details.**
+
+Key points:
+- Spawned via `delegate_task(goal, context, parallelism=1)` tool
+- Each child isolated (fresh conversation, own terminal session)
+- Parent sees only summary; child's tool calls not visible to parent's loop
+- Kanban pattern: shared task queue with multiple workers
+
+---
+
+### **12. Human-in-the-Loop**
+
+**Approval gate:** [tools/approval.py](tools/approval.py)
+
+- Dangerous commands (file mutations, git push, deployment) prompt for confirmation
+- CLI: interactive `[y/n/once/always]` prompt
+- Gateway: adds to per-session approval queue; Telegram/Discord user confirms via chat
+- Subagent default: auto-deny (safe mode); can opt in via config
+
+**Clarify tool:** Ask user a question mid-turn without breaking iteration
+- `clarify(question, options=[...], timeout_s=60)`
+- Blocks tool loop until user responds
+- Gateway queues it for async response
+
+**Cron delivery:** Results sent back to originating platform (Telegram notification, Discord DM, email)
+
+---
+
+### **13. Sandboxing / Safety**
+
+**File safety:** [agent/file_safety.py](agent/file_safety.py), [tools/path_security.py](tools/path_security.py)
+
+- Prevents traversal (`../../../etc/passwd`)
+- Blocks dangerous absolute paths (`/etc`, `/sys`, `/proc` on Linux)
+- Per-tool scope: terminal can exec anything; file tools scoped to project
+
+**Terminal sandboxing (per backend):**
+- **Local:** Native shell (no isolation)
+- **Docker:** Container with read-only root except mounted workspace
+- **SSH:** Remote host with resource limits
+- **Modal/Daytona:** Ephemeral function with timeout
+
+**Tool guardrails:** [agent/tool_guardrails.py](agent/tool_guardrails.py)
+
+- Pre-call: decision (ALLOW / DENY / CLARIFY)
+- Post-call: result sanitization (strip passwords, API keys from output)
+- Pattern matching: threat_patterns.py scans for SSH backdoors, exfil URLs, persistence commands
+
+**Prompt injection defense:** [tools/threat_patterns.py](tools/threat_patterns.py)
+
+- Context files (SOUL.md, AGENTS.md, .cursorrules) scanned before injection
+- Scope: "context" (blocks classic injection), "strict" (SSH backdoor, persistence)
+- Findings logged; content replaced with placeholder `[BLOCKED: ...]`
+
+---
+
+### **14. Observability**
+
+**Structured logging:** [hermes_logging.py](hermes_logging.py)
+
+- Agent logs to `~/.hermes/sessions/{session_id}/agent.log` (per-session)
+- Level: INFO (default), DEBUG (verbose), WARNING (retry traces)
+- Format: JSON + text hybrid for CLI readability
+
+**Streaming events:** Callbacks registered on AIAgent
+
+| Callback | Fired When | Use Case |
+|----------|-----------|----------|
+| `thinking_callback(text)` | Provider thinking block starts | TUI spinner update |
+| `reasoning_callback(reasoning_obj)` | Extended thinking / reasoning token stream | Display reasoning to user |
+| `tool_start_callback(name, args)` | Tool execution begins | TUI status "Running terminal..." |
+| `tool_complete_callback(name, result)` | Tool finishes | TUI inline result preview |
+| `stream_delta_callback(delta)` | Token streamed | TUI live text reveal |
+| `interim_assistant_callback(text)` | Partial assistant text while streaming | Live chat display |
+| `status_callback(kind, message)` | Retry, fallback, compression events | Gateway: post to status API |
+| `event_callback(event_name, data)` | Generic events (completion, error, context overflow) | Observability plugins |
+
+**Background metrics:** [agent/billing_usage.py](agent/billing_usage.py), [agent/usage_pricing.py](agent/usage_pricing.py)
+
+- Token counts: input, output, cache_read, cache_write, reasoning (Anthropic Claude thinking)
+- Estimated cost: per-provider pricing lookup
+- Session totals: cumulative over turn sequence
+
+**Telemetry (opt-in via config):**
+- [agent/trace_upload.py](agent/trace_upload.py): POST session traces to external observability backend
+- Dead-letter queue: `~/.hermes/sessions/{session_id}/trace_backlog.jsonl` if backend unreachable
+
+---
+
+### **15. Evaluation / Testing**
+
+**Location:** [evals/](evals/), [tests/](tests/), [batch_runner.py](batch_runner.py)
+
+#### **Trajectory Collection**
+- [batch_runner.py](batch_runner.py): Spawns N parallel AIAgent instances to generate training data
+- Each agent: `run_conversation(prompt)`, captures full history (messages + tool results)
+- Output: JSONL trajectory files for model fine-tuning
+- Compression: [trajectory_compressor.py](trajectory_compressor.py) — compress long trajectories into summaries + tool specs for efficient training
+
+#### **Unit Tests**
+- [tests/run_agent/](tests/run_agent/) — AIAgent loop, tool dispatch, retry logic
+- [tests/tools/](tests/tools/) — individual tool handlers
+- [tests/test_prompt_builder.py](tests/test_prompt_builder.py) — system prompt assembly
+- Pattern: pytest + monkeypatch; mock OpenAI SDK calls
+
+#### **Integration Tests**
+- [tests-js/](tests-js/) — TUI/desktop component tests (Jest)
+- [evals/browser_use/](evals/browser_use/), [evals/compaction/](evals/compaction/), [evals/readtool/](evals/readtool/) — scenario-specific eval suites
+
+#### **Behavior contract tests** (per AGENTS.md philosophy)
+- Not value snapshots ("list has 42 items") — assert invariants ("all tools have schemas")
+- Change-detector tests discouraged; instead: "role alternation never breaks", "cache prefix stable"
+
+---
+
+### **16. Configuration**
+
+**Location:** [hermes_cli/config.py](hermes_cli/config.py), [~/.hermes/config.yaml](~/.hermes/config.yaml)
+
+**Key schema:**
+
+```yaml
+model: claude-opus-4
+provider: anthropic
+api_key: sk-ant-...
+
+providers:
+  anthropic:
+    request_timeout_seconds: 300
+    models:
+      claude-opus-4:
+        max_tokens: 4096
+        cache_control: true
+        stale_timeout_seconds: 120
+
+memory:
+  provider: honcho  # or hindsight, mem0, supermemory
+  mode: hybrid      # hybrid = local + external
+
+compression:
+  enabled: true
+  threshold_tokens: 80000
+  model: claude-opus-4-mini  # summarization LLM
+  anti_thrash_cooldown_s: 600
+
+delegation:
+  max_spawn_depth: 2
+  max_concurrent_children: 10
+  subagent_auto_approve: false  # safe default
+
+gateway:
+  telegram:
+    token: "..."
+    bot_name: "@my_bot"
+  discord:
+    token: "..."
+  slack:
+    signing_secret: "..."
+
+platform_hints:
+  cli:
+    replace: "You are in a terminal. Use `tree` instead of `ls`."
+  telegram:
+    append: "Messages are limited to 4096 chars."
+```
+
+**Load order:**
+1. Hardcoded defaults
+2. `~/.hermes/config.yaml` (user global config)
+3. `~/.hermes/.env` (secrets, via `python-dotenv`)
+4. CLI args (override everything)
+5. Profile-specific overrides (`~/.hermes/profiles/{name}/config.yaml`)
+
+---
+
+### **17. Entry Points**
+
+**Direct CLI:**
+- `hermes` — Interactive TUI (default)
+- `hermes chat -q "What is 2+2?"` — Single-turn (one-shot mode)
+- `hermes gateway start` — Daemon mode (Telegram/Discord/etc.)
+- `hermes acp` — VS Code ACP server
+- `hermes cron` — Manage scheduled jobs
+- `hermes setup` — Interactive wizard
+- `hermes doctor` — Diagnostics
+
+**Programmatic:**
+```python
+from run_agent import AIAgent
+agent = AIAgent(
+    model="claude-opus-4",
+    provider="anthropic",
+    api_key="sk-ant-...",
+    session_id="my_session",
+)
+response = agent.run_conversation("Tell me a joke")
+print(response)
+```
+
+**Web/RPC:**
+- Gateway HTTP: POST `/messages` with `{"content": "...", "user_id": "..."}`
+- Returns streaming WebSocket or polling endpoint for results
+
+---
+
+### **18. Notable Idioms / Patterns**
+
+#### **18.1 Prompt Caching (Cache-Safe Architecture)**
+
+**Why:** A 50K-token system prompt + 100K conversation history = 150K tokens per API call. With 10-turn interaction = 1.5M tokens. Prefix caching (Anthropic) + KV cache (OpenAI o1) saves 90% on reused system + early history.
+
+**Rule:** System prompt must be byte-stable for the life of a session. Never:
+- Swap toolsets mid-conversation (would invalidate cache)
+- Rebuild system prompt (only on compression)
+- Inject synthetic user messages mid-loop (breaks role alternation, cache mismatch)
+
+**Implementation:** [agent/prompt_cache_scope.py](agent/prompt_cache_scope.py), [agent/prompt_caching.py](agent/prompt_caching.py)
+
+#### **18.2 ReAct (Reason → Act → Observe Loop)**
+
+**Structure (per iteration):**
+```
+Model sees: [system, past_messages]
+  ↓
+Model outputs: assistant_message (text + tool_calls)
+  ↓
+Agent dispatches: tools in parallel (8 workers max)
+  ↓
+Collect results → append as tool messages
+  ↓
+Loop back if finish_reason == "tool_calls"
+  ↓
+Exit if finish_reason == "stop" or "length"
+```
+
+No explicit reasoning step; reasoning is implicit in model's chain-of-thought (visible in streaming deltas).
+
+#### **18.3 Ephemeral Scaffolding**
+
+**Problem:** Model returns empty response, or only finish_reason=tool_calls with no tool calls. Infinite loop risk.
+
+**Solution:** Inject synthetic "(empty)" assistant turn + nudge user message to trigger retry:
+```python
+if response.content == "":
+    messages.append({"role": "assistant", "content": "(empty)", "_empty_recovery_synthetic": True})
+    messages.append({"role": "user", "content": "Please provide a response.", "_empty_recovery_nudge": True})
+    # Loop back to API call
+```
+
+These scaffolds are **never persisted** to SQLite (markers pop them in [agent/turn_finalizer.py](agent/turn_finalizer.py#L1)).
+
+#### **18.4 Tool Result Spillover (Oversized Output)**
+
+**Problem:** Tool returns 500KB output (git log, large API response). Model context window can't fit.
+
+**Solution:** [tools/tool_result_storage.py](tools/tool_result_storage.py)
+- Write to disk: `~/.hermes/sessions/{session_id}/{tool_name}_{call_id}.output`
+- Inject pointer: `{"role": "tool", "content": "<persisted-output>/path/to/file</persisted-output> Summary: ..."}`
+- Model sees summary in-context; can request full content via pointer
+
+#### **18.5 Parallel Tool Execution with Safety Checks**
+
+**Path overlap detection:** [agent/tool_dispatch_helpers.py::_paths_overlap](agent/tool_dispatch_helpers.py)
+```python
+tool1_call = {"function": {"name": "write_file", "arguments": {"path": "/project/src/main.py"}}}
+tool2_call = {"function": {"name": "write_file", "arguments": {"path": "/project/src/main.py"}}}
+# Paths identical → sequential
+
+tool1_call = {"function": {"name": "write_file", "arguments": {"path": "/project/src/main.py"}}}
+tool2_call = {"function": {"name": "read_file", "arguments": {"path": "/project/src/lib.py"}}}
+# Paths disjoint → safe to parallel
+```
+
+#### **18.6 Native Function-Calling Format**
+
+**Hermes uses OpenAI's native JSON schema** (not XML, not custom DSL):
+
+**Tool schema (sent to model):**
+```json
+{
+  "type": "function",
+  "function": {
+    "name": "terminal",
+    "description": "Execute a shell command",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "cmd": {"type": "string", "description": "Command to run"},
+        "timeout_s": {"type": "number", "default": 30}
+      },
+      "required": ["cmd"]
+    }
+  }
+}
+```
+
+**Model response (finish_reason="tool_calls"):**
+```json
+{
+  "tool_calls": [
+    {
+      "id": "call_abc123",
+      "type": "function",
+      "function": {
+        "name": "terminal",
+        "arguments": "{\"cmd\": \"ls -la /tmp\"}"
+      }
+    }
+  ]
+}
+```
+
+**Agent injects result:**
+```json
+{
+  "role": "tool",
+  "tool_call_id": "call_abc123",
+  "content": "total 12\ndrwxrwxrwt 15 root root ...",
+  "name": "terminal"
+}
+```
+
+No XML tags like `<tool_call>` or `<invoke>` — pure OpenAI standard.
+
+#### **18.7 Streaming & Display**
+
+**Streaming transport:** [agent/transports/chat_completions.py](agent/transports/chat_completions.py)
+
+- Server-sent events (SSE) streamed to client
+- Delta events: `{"delta": {"content": "Hello"}}`
+- Aggregated in memory during turn
+- Displayed live to user via `stream_delta_callback`
+
+**TUI streaming:** [cli.py](cli.py) registers callback; prompt_toolkit updates live input area
+
+---
+
+### **19. Data Flow Diagram (Textual)**
+
+```
+User Input (CLI, Telegram, Discord, etc.)
+    ↓
+[CLICommandsMixin | GatewayPlatformAdapter]
+    ↓
+AIAgent.run_conversation(user_text)
+    ├─ [MemoryProvider.prefetch] → session search, external memory recall
+    ├─ [ContextCompressor.should_compress] → decide if context > threshold
+    │   └─ If yes: [ContextCompressor.compress_context] → call summary LLM
+    ├─ [AIAgent._build_system_prompt] → assemble 3-tier prompt
+    │   ├─ Load identity (SOUL.md or DEFAULT_AGENT_IDENTITY)
+    │   ├─ Scan context files (.hermes.md, AGENTS.md, .cursorrules)
+    │   ├─ Inject skills index
+    │   └─ Inject memory snapshot
+    ├─ [AIAgent._build_api_request] → chat completions payload
+    │   ├─ Sanitize messages (surrogates, non-ASCII, tool IDs)
+    │   ├─ Estimate tokens
+    │   └─ Apply provider-specific headers
+    ├─ [OpenAI SDK | Provider Adapter]
+    │   └─ POST /v1/chat/completions (with streaming)
+    │       ├─ Live streaming: delta → stream_delta_callback
+    │       └─ On finish_reason="tool_calls": tool_calls array
+    ├─ [AIAgent._execute_tool_calls_concurrent | sequential]
+    │   ├─ Parallel? Check path overlap, destructiveness
+    │   ├─ [model_tools.handle_function_call(name, args)]
+    │   │   ├─ Dispatch via [tools/registry.dispatch]
+    │   │   └─ Tool handler returns string (JSON or plain text)
+    │   ├─ Tool guardrails: pre-call decision (ALLOW/DENY/CLARIFY)
+    │   ├─ Collect results; if oversized, spillover to disk
+    │   └─ Append as tool messages → messages list
+    ├─ If finish_reason == "tool_calls": Loop back to API call
+    ├─ Else (stop/length): Exit loop
+    ├─ [AIAgent._ensure_db_session] → create SQLite row if needed
+    ├─ [AIAgent._flush_messages_to_session_db] → persist transcript
+    │   └─ Ephemeral scaffolds NOT persisted (pop markers)
+    ├─ [MemoryProvider.sync_turn] → async memory write (if async)
+    └─ Return final_response
+        ↓
+    [Render to User]
+    ├─ CLI: print via prompt_toolkit or _safe_print
+    ├─ Telegram: send_message (chunked to 4096 chars)
+    ├─ Gateway: POST result to session DB / webhook
+    └─ Desktop TUI: inject into chat feed, update UI
+```
+
+**Background (async, post-turn):**
+```
+[Background Review Thread]
+    ├─ If complex task (5+ tool calls, fixed bug, new workflow)
+    ├─ [Curator.review] → evaluate if skill should be saved
+    ├─ [SkillManager.save_or_update_skill] → persist to ~/.hermes/skills/
+    └─ Next turn, skill available in schema
+```
+
+---
+
+### **20. Weaknesses / Gaps**
+
+#### **Architectural Gaps**
+
+1. **No multi-model ensembling (MoA off by default)**
+   - Mixture of Agents (MoA) available via [agent/moa_loop.py](agent/moa_loop.py) but requires explicit config
+   - Default: single-model ReAct (no advisor diversity)
+   - Mitigation: fallback_model chain provides redundancy, not diversity
+
+2. **Planning is reactive, not proactive**
+   - No explicit goal decomposition (STRIPS, HTN planning)
+   - Relies on model's emergent reasoning + learned skills
+   - Long-horizon tasks may thrash without explicit subgoal milestones
+
+3. **Memory provider is single-instance**
+   - Only one external memory provider active at a time
+   - Can't combine Honcho dialectic + vector DB for semantic + relational recall
+   - Workaround: plugin integration (custom provider composing multiple backends)
+
+4. **Tool parallelization is greedy**
+   - No task scheduling or priority queue (FIFO dispatch)
+   - Expensive tools (GPT-4 vision, video generation) can block cheaper ones
+   - Mitigation: agent can ask user "run in parallel?" but no auto-prioritization
+
+5. **Context compression is lossy**
+   - Summary LLM (default: claude-opus-4-mini) may drop important details
+   - Compression cooldown (600s default) prevents re-compression thrashing but can leave context oversized
+   - Mitigation: manual `/compact` command; config-driven thresholds
+
+6. **Subagent isolation is shallow**
+   - Children inherit parent's credential context (base_url, api_key, provider)
+   - Can't spawn specialized agents with different models mid-session without manual setup
+   - Workaround: per-profile config with different providers per use case
+
+#### **Performance / Scaling Gaps**
+
+1. **Token estimation is rough**
+   - `estimate_request_tokens_rough()` uses character heuristics (not tiktoken)
+   - Can over/under-estimate, especially with tool schemas and multimodal content
+   - Impact: compression triggered too early or too late
+
+2. **No distributed execution**
+   - Subagents spawn in ThreadPoolExecutor on local/remote host
+   - No work queue (Celery, Ray, Kubernetes) for horizontal scaling
+   - Daytona/Modal are per-session ephemeral; no long-lived agent pool
+
+3. **SQLite is single-host**
+   - ~/.hermes/state.db accessed by all processes on same machine
+   - No sync for multi-device sessions (laptop + cloud agent)
+   - Workaround: Hermes Portal (cloud-backed state sync) but adds latency
+
+#### **Safety / Observability Gaps**
+
+1. **No formal capability audit**
+   - Tool guardrails are heuristics (path prefix checks, pattern matching)
+   - No formal model of tool dependencies or security domains
+   - Rogue skill or MCP server can bypass approval gates
+
+2. **No differential privacy**
+   - Session data (including user PII) flushed to SQLite unencrypted
+   - External memory providers receive full context without redaction
+   - Mitigation: user responsibility to avoid sensitive input; ~no support yet for encrypted state
+
+3. **Limited observability on cascade failures**
+   - Tool result size overflow, compression failure, memory flush failure all logged but not surfaced to user live
+   - No dedicated status dashboard (gateway status API exists but raw)
+
+#### **User Experience Gaps**
+
+1. **Skill discovery is passive**
+   - Skills are created autonomously but not actively recommended
+   - User must remember `skill_view()` to check what's available
+   - No "you could use X skill for this task" nudge
+
+2. **No explain-ability for long traces**
+   - 20-turn conversation with 10+ tool calls — no summary of "why did the agent do X?"
+   - Session search finds historical data but not causal reasoning
+
+3. **Mobile-first platforms (WhatsApp, Signal) are second-class**
+   - No persistent conversation handles; each message is a fresh context fetch
+   - Breaks for stateful tasks (branching, conditional tool use)
+
+---
+
+## Summary
+
+**Hermes Agent is a production-grade, self-improving agentic framework that**:
+
+- **Runs anywhere:** CLI, TUI, Desktop, 7 messaging platforms, serverless (Modal/Daytona)
+- **Learns autonomously:** Skills created mid-session, memory improved over time, user preferences captured
+- **Scales horizontally:** Delegates work to subagents, coordinates via kanban board, parallelizes tool calls
+- **Optimizes cost:** Prompt-prefix caching, context compression, credential pooling + fallback chains
+- **Uses native function-calling:** OpenAI JSON schema (not XML/DSL), multi-hop tool iteration
+- **Integrates deeply:** MCP servers, plugins, custom memory providers, external observability
+
+**Core loop:** ReAct-style (reason + act + observe), with prompt-cache safety, ephemeral scaffolding recovery, and spillover for large results.
+
+**Key innovation:** The "closed learning loop" — autonomous skill creation + memory management + background review, turning one-off tasks into reusable workflows without user intervention.

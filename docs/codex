@@ -1,0 +1,1412 @@
+---
+
+# CODEX CLI (OPENAI) — COMPREHENSIVE ARCHITECTURAL ANALYSIS
+
+## 1. PROJECT IDENTITY & PURPOSE
+
+**Codex CLI** is OpenAI's locally-run coding agent. It is:
+- A command-line agent that executes coding tasks autonomously on your machine
+- Available as standalone binary (macOS, Linux, Windows), npm package (`@openai/codex`), or Homebrew
+- Integrated into ChatGPT Pro/Business/Edu plans; can also use API keys
+- Part of a larger ecosystem: Codex Web (cloud-based), Codex IDE integrations (VS Code, Cursor, Windsurf)
+- **Problem domain**: Autonomous code generation, modification, testing, and project understanding
+
+**Entry points**:
+- CLI: `codex` (TUI mode) → [codex-rs/cli/src/main.rs](codex-rs/cli/src/main.rs)
+- Subcommands: `codex app` (desktop), `codex mcp` (MCP server), `codex login`, `codex doctor`
+- App Server (daemon): JSON-RPC protocol over IPC → [codex-rs/app-server/src/lib.rs](codex-rs/app-server/src/lib.rs)
+
+---
+
+## 2. LANGUAGES & RUNTIME
+
+### Rust (codex-rs/)
+- **Core agent logic**: Monorepo with 100+ interdependent crates (Cargo workspace)
+- **Edition**: Rust 2024
+- **Build system**: Bazel + Cargo (dual build)
+- **Key crates by domain**:
+  - Agent orchestration: `core`, `agent-graph-store`
+  - Execution: `exec`, `shell-command`, `exec-server`
+  - Sandboxing: `sandboxing`, `linux-sandbox`, `windows-sandbox-rs`
+  - Tooling: `tools`, `apply-patch`, `mcp-server`, `mcp`
+  - Models: `model-provider`, `responses-api-proxy`
+  - Persistence: `state`, `rollout`, `history`
+  - TUI: `tui` (ratatui-based)
+
+### TypeScript/JavaScript (codex-cli/)
+- **Purpose**: Minimal; config/installer scripts
+- **Package manager**: pnpm 10.34.5+ (monorepo workspace)
+- **Node version**: ≥22
+
+### Platform Support
+- **macOS**: aarch64 (arm64) & x86_64; Seatbelt sandbox (`/usr/bin/sandbox-exec`)
+- **Linux**: x86_64 & aarch64; Landlock + bwrap (bubblewrap) sandbox
+- **Windows**: RestrictedToken or Elevated modes (Windows Sandbox)
+
+---
+
+## 3. DEPENDENCIES
+
+### Cargo.toml (Rust) — Key External Dependencies
+
+**LLM & API**:
+- `openai-client` wrapper via `codex-api` (Responses API + Chat Completions)
+- `reqwest` 0.12 (HTTP client)
+- `jsonwebtoken` 9.3.1 (JWT for auth)
+
+**MCP (Model Context Protocol)**:
+- `@modelcontextprotocol/sdk` v1.26.0 (resolved in package.json)
+- `codex-mcp`, `codex-mcp-server` (first-party wrappers)
+
+**Async & Concurrency**:
+- `tokio` (async runtime)
+- `async-channel` 2.3.1
+- `futures` 0.3
+- `crossbeam-channel` 0.5.15
+
+**TUI & Rendering**:
+- `ratatui` 0.30.2 (terminal UI)
+- `crossterm` 0.29.0 (terminal control)
+- `ansi-to-tui` 8.0.1
+
+**Sandbox & Security**:
+- `landlock` 0.4.4 (Linux)
+- `clatter` 2.2.0 (encryption: AES-GCM, ML-KEM)
+- `crypto_box` 0.9.1 (sealed encryption)
+- `ed25519-dalek` 2.2.0
+
+**Database & State**:
+- `sqlx` (bundled SQLite 0.37, WAL-reset corruption fix)
+- `tokio::sync` (Mutex, watch, Semaphore)
+
+**Observability**:
+- `opentelemetry` 0.31.0, `opentelemetry-otlp`, `opentelemetry_sdk`
+- `tracing`, `tracing-subscriber`
+- `log` 0.4
+
+**Utilities**:
+- `serde` + `serde_json`
+- `regex` 1.12.3
+- `axum` 0.8 (web framework for app-server)
+- `portable-pty` 0.9.0 (pseudo-terminal)
+- `diffy` 0.4.2 (diff generation)
+- `bm25` 2.3.2 (ranking)
+
+### package.json (TypeScript) — Key Resolutions
+
+```json
+"@modelcontextprotocol/sdk": "1.26.0",
+"prettier": "^3.5.3",
+"esbuild": "0.28.1",
+"rollup": "4.59.0",
+"hono": "4.12.25"
+```
+
+---
+
+## 4. TOP-LEVEL DIRECTORY LAYOUT
+
+```
+/workspaces/literate-winner/reference/codex/
+├── AGENTS.md                       # Contribution guide (139+ sections on coding norms)
+├── Cargo.toml                      # Root workspace (100+ member crates)
+├── MODULE.bazel, BUILD.bazel       # Bazel config
+├── package.json                    # Root pnpm workspace
+├── pnpm-workspace.yaml             # pnpm monorepo config
+├── flake.nix                       # Nix dev environment
+├── justfile                        # Task runner (just fmt, just test, etc.)
+├── .bazelrc, .bazelignore          # Bazel settings
+├── .devcontainer/                  # VS Code remote container config
+│
+├── codex-rs/                       # 🦀 Main Rust monorepo
+│   ├── Cargo.toml                  # Workspace root
+│   ├── Cargo.lock
+│   ├── rust-toolchain.toml         # Pin Rust version
+│   ├── clippy.toml, rustfmt.toml   # Linter config
+│   ├── deny.toml                   # Dependency audit
+│   │
+│   ├── core/                       # 🔥 Core agent (largest crate)
+│   │   ├── src/
+│   │   │   ├── agent/              # Multi-agent orchestration
+│   │   │   │   ├── control.rs      # AgentControl (spawn/message)
+│   │   │   │   ├── registry.rs     # Agent registry & metadata
+│   │   │   │   ├── role.rs         # Agent role resolution
+│   │   │   │   └── status.rs       # Agent lifecycle states
+│   │   │   ├── session/            # Session lifecycle
+│   │   │   │   ├── session.rs      # Main Session struct
+│   │   │   │   ├── turn.rs         # run_turn() main loop
+│   │   │   │   ├── turn_context.rs # Turn-scoped context
+│   │   │   │   ├── handlers.rs     # Session event handlers
+│   │   │   │   └── multi_agents/   # Sub-agent communication
+│   │   │   ├── state/              # Session state snapshot
+│   │   │   ├── tools/              # Tool system (100+ files)
+│   │   │   │   ├── registry.rs     # Tool lookup & dispatch
+│   │   │   │   ├── router.rs       # ToolRouter (specs, calls)
+│   │   │   │   ├── orchestrator.rs # Approval→Sandbox→Retry
+│   │   │   │   ├── approvals.rs    # Guardian approval pipeline
+│   │   │   │   ├── sandboxing.rs   # Sandbox traits/traits
+│   │   │   │   ├── handlers/       # Handler impls (apply_patch, exec, mcp, etc.)
+│   │   │   │   │   ├── apply_patch.rs
+│   │   │   │   │   ├── unified_exec/
+│   │   │   │   │   ├── mcp.rs
+│   │   │   │   │   └── multi_agents/
+│   │   │   │   └── runtimes/       # Tool execution runtimes
+│   │   │   ├── mcp.rs              # MCP integration hook
+│   │   │   ├── exec.rs             # Execution policy & shell
+│   │   │   ├── shell.rs            # Shell invocation
+│   │   │   ├── apply_patch.rs      # apply-patch tool wrapper
+│   │   │   ├── skills.rs           # Skills framework integration
+│   │   │   ├── realtime_conversation/
+│   │   │   │   └── bem.rs          # Streaming response handling
+│   │   │   ├── prompts/            # (via codex-prompts crate)
+│   │   │   ├── context/            # Context fragment injection
+│   │   │   ├── memories/           # Memory subsystem
+│   │   │   ├── sandboxing/         # Sandbox decision logic
+│   │   │   ├── windows_sandbox.rs  # Windows sandbox config
+│   │   │   ├── guardian/           # Approval review (Guardian framework)
+│   │   │   ├── rollout.rs          # Rollout recording
+│   │   │   ├── client.rs           # Model client wrapper
+│   │   │   ├── config/             # Config loading & validation
+│   │   │   └── lib.rs
+│   │   ├── config.schema.json      # JSON schema for config.toml
+│   │   ├── config.md               # Config documentation
+│   │   ├── gpt_5_*_prompt.md       # Embedded system prompts
+│   │   └── tests/                  # Integration tests (test_codex builder)
+│   │
+│   ├── cli/                        # CLI entrypoint
+│   │   ├── src/
+│   │   │   ├── main.rs             # clap CLI parser
+│   │   │   ├── login.rs            # Auth flow
+│   │   │   ├── mcp_cmd.rs          # MCP server subcommand
+│   │   │   ├── app_cmd.rs          # Desktop app subcommand
+│   │   │   ├── doctor.rs           # Diagnostics
+│   │   │   └── desktop_app/        # App tray integration
+│   │   └── bin/                    # Binary entry (arg0 dispatch)
+│   │
+│   ├── tui/                        # Terminal UI
+│   │   ├── src/
+│   │   │   ├── app.rs              # 🔥 Main TUI state machine
+│   │   │   ├── chatwidget.rs       # Chat message rendering
+│   │   │   ├── bottom_pane/        # Approval UI, input composer
+│   │   │   ├── diff_render.rs      # Patch preview
+│   │   │   ├── snapshot/           # insta snapshots (UI regression tests)
+│   │   │   └── styles.md           # Styling conventions
+│   │
+│   ├── app-server/                 # Daemon JSON-RPC server
+│   │   ├── src/
+│   │   │   ├── lib.rs              # Server bootstrap
+│   │   │   ├── transport/          # IPC, WebSocket, stdio
+│   │   │   ├── message_processor.rs # RPC dispatch
+│   │   │   └── README.md           # API docs
+│   │   └── protocol/               # v1, v2 protocol definitions
+│   │
+│   ├── apply-patch/                # Patch parsing & application
+│   │   ├── src/
+│   │   │   ├── lib.rs
+│   │   │   ├── parser.rs           # Lark grammar implementation
+│   │   │   ├── file_update.rs      # Hunk merging
+│   │   │   ├── invocation.rs       # CLI invocation
+│   │   │   └── streaming_parser.rs # Streaming parse
+│   │
+│   ├── model-provider/             # LLM provider abstraction
+│   │   ├── src/
+│   │   │   ├── lib.rs
+│   │   │   ├── provider.rs         # ModelProvider trait
+│   │   │   ├── auth.rs             # Auth resolver
+│   │   │   └── amazon_bedrock.rs   # Bedrock implementation
+│   │
+│   ├── responses-api-proxy/        # Responses API forwarding
+│   │   ├── src/
+│   │   │   ├── lib.rs
+│   │   │   ├── dump.rs             # Request/response dumping
+│   │   │   └── read_api_key.rs     # Auth handling
+│   │
+│   ├── codex-mcp/                  # MCP client & server
+│   ├── mcp-server/                 # MCP server runtime
+│   ├── skills/                     # System skills framework
+│   ├── sandboxing/                 # Sandbox abstraction
+│   ├── linux-sandbox/              # Linux (Landlock + bwrap)
+│   ├── windows-sandbox-rs/         # Windows Sandbox integration
+│   ├── agent-graph-store/          # DAG for agent spawning
+│   ├── history/                    # Turn history
+│   ├── state/                      # SQLite state DB
+│   ├── rollout/                    # Rollout recording/replay
+│   │
+│   └── ext/                        # Extension system
+│       ├── agent/                  # Agent extensions
+│       ├── mcp/                    # MCP extensions
+│       ├── skills/                 # Skills extensions
+│       ├── memories/               # Memory extensions
+│       └── ...
+│
+├── codex-cli/                      # TypeScript CLI (minimal)
+│   ├── package.json
+│   ├── bin/                        # Entry points
+│   └── scripts/
+│
+├── sdk/                            # JavaScript SDK (if present)
+├── docs/                           # User docs
+├── scripts/                        # Build helpers
+├── tools/                          # Build tools
+├── patches/                        # Dependency patches
+└── third_party/                    # Vendored code
+```
+
+---
+
+## 5. AGENT ARCHITECTURE
+
+### High-Level Orchestration
+
+**Entry**: [codex-rs/core/src/session/turn.rs](codex-rs/core/src/session/turn.rs) `run_turn()`
+
+```
+User Input
+    ↓
+Session.run_turn()
+    ├─ Pre-sampling compaction (context budget mgmt)
+    ├─ Resolve required MCP servers & plugins
+    ├─ Run sampling loop:
+    │  ├─ Send context + message history to model (Responses API)
+    │  ├─ Stream model response (SSE with `*ResponseItem`)
+    │  ├─ Parse response items:
+    │  │  ├─ FunctionCall → Tool routing
+    │  │  ├─ AssistantMessage → Record & finalize turn
+    │  │  └─ ReasoningStart/Content → Cache reasoning
+    │  │
+    │  ├─ If FunctionCall:
+    │  │  ├─ Route to ToolRouter (MCP, builtin, dynamic)
+    │  │  ├─ Orchestrator: Approval → Select Sandbox → Execute → Retry
+    │  │  └─ Send result back in next request
+    │  │
+    │  └─ If done: Post-sampling compaction
+    │
+    └─ Record final rollout, persist to SQLite
+```
+
+**Key loop file**: [turn.rs](codex-rs/core/src/session/turn.rs) (starts at ~200 lines)
+
+### Multi-Agent (Hierarchical)
+
+- **Framework**: `codex-agent-graph-store` stores parent→child spawn edges
+- **Control plane**: [core/src/agent/control.rs](codex-rs/core/src/agent/control.rs) `AgentControl`
+  - Spawns new agent threads via `spawn_agent` tool
+  - Manages `AgentRegistry` per session (not global)
+  - Inter-agent communication via message tools
+- **Delegation**: `spawn_agent` tool (v1) + `spawn_agent` v2 with fork modes
+  - `FullHistory`: Clone entire parent history
+  - `LastNTurns(n)`: Truncate to N recent turns
+- **V2 multi-agent**: Concurrent execution limits, quota budgeting in [config.schema.json](codex-rs/core/config.schema.json)
+
+### Agent Pattern
+
+**Not** ReAct-style turn-by-turn reflection. Instead:
+- **Planner-Executor hybrid**: Model outputs `plan` item + tool calls in same response
+- **Streaming parsing**: Assistant text parsed for `## Plan` sections via [AssistantTextStreamParser](codex-rs/core/src/stream_events_utils.rs)
+- **Goal continuity**: Model kept in context with original user goal; can spawn sub-agents for sub-goals
+
+### State Management
+
+**Per-session state**: [Session struct](codex-rs/core/src/session/session.rs)
+```rust
+pub struct Session {
+    pub thread_id: ThreadId,
+    pub tx_event: Sender<Event>,            // Broadcast channel for UI
+    pub state: Mutex<SessionState>,         // Mutable session snapshot
+    pub conversation: Arc<RealtimeConversationManager>,  // Message history
+    pub active_turn: Mutex<Option<ActiveTurn>>,         // Current turn
+    pub services: SessionServices,          // Shared services
+    ...
+}
+```
+
+**Persistence**: Rollout-based append-only log
+- Each turn recorded as `RolloutItem` in [codex-rollout](codex-rs/rollout/)
+- Stored in SQLite state DB at `~/.codex/state.db`
+- Resume via `ThreadStore::resume_thread()` rehydration
+
+### Message/History Representation
+
+**Responses API style** (not Chat Completions):
+- Model receives `ResponseInputItem` (one-way, not turn-by-turn)
+- Items include:
+  - `AssistantText` (model's last output)
+  - `ToolResult` (from executed tools)
+  - `ContextInjection` (fragments: files, memories, etc.)
+- No explicit `role: assistant/user` turnarounds; implicit via item order
+
+**History compaction**: 
+- Inline auto-compact (`compact.rs`) and remote auto-compact (`compact_remote.rs`)
+- Summarization via model (smaller model preferred, e.g., `gpt-5.6-luna`)
+- Token budget: Per-config limit (e.g., 80k default)
+
+---
+
+## 6. LLM PROVIDER ABSTRACTION
+
+### Multi-Provider Support
+
+**Trait**: [model-provider/src/provider.rs](codex-rs/model-provider/src/provider.rs) `ModelProvider`
+
+```rust
+pub trait ModelProvider: Debug + Send + Sync {
+    fn info(&self) -> &ModelProviderInfo;
+    fn capabilities(&self) -> ProviderCapabilities { ... }
+    fn approval_review_model(&self) -> &str { ... }
+    fn memory_extraction_model(&self) -> &str { ... }
+    // ...
+}
+```
+
+**Implementations**:
+1. **OpenAI** (default): Chat Completions & Responses API
+   - Provider ID: `chatgpt` (via auth)
+   - Endpoint: `https://api.openai.com/v1/responses`
+2. **Amazon Bedrock**: Runtime provider
+   - Provider ID: `amazon-bedrock`, `amazon-bedrock-runtime`
+   - Region-based auth (SigV4)
+3. **Local models**: `lmstudio`, `ollama` (config-driven)
+4. **API key auth**: Fallback support
+
+**Responses API**: Proxied via [responses-api-proxy](codex-rs/responses-api-proxy/)
+- Listens on ephemeral port
+- Forwards POST `/v1/responses` to OpenAI
+- Dumps request/response for debugging
+
+### Streaming & Model Features
+
+- **Streaming**: SSE (Server-Sent Events) parsing in [realtime_conversation.rs](codex-rs/core/src/realtime_conversation/)
+- **Prompt caching**: Supported via Responses API headers
+- **Reasoning models** (o3/o4): Parameter `reasoning_effort` in config; handled transparently
+- **Vision**: Image encoding via `image-rs` + URL passing
+- **Function calling**: Native tool_choice + function_call in Responses API
+
+### Failure Recovery
+
+**Provider auth recovery**: `ProviderUnauthorizedRecovery::Recovered` trigger re-auth flow
+
+---
+
+## 7. TOOL SYSTEM
+
+### Tool Definition & Registration
+
+**Registry**: [core/src/tools/registry.rs](codex-rs/core/src/tools/registry.rs)
+
+```rust
+pub(crate) trait CoreToolRuntime: ToolExecutor<ToolInvocation> {
+    fn immutable_spec(&self) -> Option<&Arc<ToolSpec>> { ... }
+    fn mcp_server_name(&self) -> Option<&str> { ... }
+    fn telemetry_tags(&self, invocation: &ToolInvocation) -> ToolTelemetryTags { ... }
+}
+```
+
+**Tool specs** (JSON schema):
+- Defined in `ToolSpec` (from `codex-tools`)
+- Registered with `ToolRouter` at turn start
+- Model-visible specs serialized and sent to Responses API
+
+### Built-In Tools (Comprehensive List)
+
+**Core Tools** (always available):
+
+| Tool | Handler | Purpose |
+|------|---------|---------|
+| `bash` / `shell` | [unified_exec](codex-rs/core/src/tools/handlers/unified_exec/) | Execute shell commands |
+| `apply_patch` | [apply_patch.rs](codex-rs/core/src/tools/handlers/apply_patch.rs) | Apply unified diff patches |
+| `view_image` | [view_image.rs](codex-rs/core/src/tools/handlers/view_image.rs) | Display images |
+| `current_time` | [current_time.rs](codex-rs/core/src/tools/handlers/current_time.rs) | Get current UTC time |
+| `wait_for_environment` | [wait_for_environment.rs](codex-rs/core/src/tools/handlers/wait_for_environment.rs) | Block on env readiness |
+| `sleep` | [sleep.rs](codex-rs/core/src/tools/handlers/sleep.rs) | Delay execution |
+| `request_permissions` | [request_permissions.rs](codex-rs/core/src/tools/handlers/request_permissions.rs) | Prompt user for perms |
+| `request_user_input` | [request_user_input.rs](codex-rs/core/src/tools/handlers/request_user_input.rs) | Prompt user for input |
+| `send_user_message_async` | [send_user_message_async.rs](codex-rs/core/src/tools/handlers/send_user_message_async.rs) | Send async message to user |
+
+**Multi-Agent Tools** (namespace: `collaboration`):
+
+| Tool | Handler | Purpose |
+|------|---------|---------|
+| `spawn_agent` | [multi_agents.rs](codex-rs/core/src/tools/handlers/multi_agents.rs) | Spawn sub-agent |
+| `send_message` | multi_agents.rs | Send inter-agent message |
+| `followup_task` | multi_agents.rs | Delegate task to agent |
+
+**Dynamic Tools**:
+
+| Tool | Handler | Purpose |
+|------|---------|---------|
+| `plan` | [plan.rs](codex-rs/core/src/tools/handlers/plan.rs) | Propose execution plan |
+| `tool_search` | [tool_search.rs](codex-rs/core/src/tools/handlers/tool_search.rs) | Search available tools |
+| `get_context_remaining` | [get_context_remaining.rs](codex-rs/core/src/tools/handlers/get_context_remaining.rs) | Remaining token budget |
+
+**MCP Tools**: 
+- Exposed via [mcp.rs](codex-rs/core/src/tools/handlers/mcp.rs)
+- Namespace: provider name (e.g., `brave-search`, `github`)
+- Specs fetched from MCP servers at session start
+
+**Extension Tools**:
+- Loaded from disk via `codex_extension_api::ToolCallOutcome`
+- Namespace: `ext/` prefix
+
+### apply_patch Tool — Format & Implementation
+
+**Lark Grammar** ([parser.rs](codex-rs/apply-patch/src/parser.rs#L1-L30)):
+
+```
+start: begin_patch environment_id? hunk+ end_patch
+begin_patch: "*** Begin Patch" LF
+environment_id: "*** Environment ID: " filename LF
+end_patch: "*** End Patch" LF?
+
+hunk: add_hunk | delete_hunk | update_hunk
+add_hunk: "*** Add File: " filename LF add_line+
+delete_hunk: "*** Delete File: " filename LF
+update_hunk: "*** Update File: " filename LF change_move? change?
+add_line: "+" /(.+)/ LF -> line
+
+change_move: "*** Move to: " filename LF
+change: (change_context | change_line)+ eof_line?
+change_context: ("@@" | "@@ " /(.+)/) LF
+change_line: ("+" | "-" | " ") /(.+)/ LF
+eof_line: "*** End of File" LF
+```
+
+**Example patch**:
+```
+*** Begin Patch
+*** Update File: src/main.rs
+@@ fn main() {
+- println!("hello");
++ println!("hello, world!");
+  }
+*** End Patch
+```
+
+**Data structures** ([parser.rs](codex-rs/apply-patch/src/parser.rs#L60-L130)):
+
+```rust
+pub enum Hunk {
+    AddFile { path: PathBuf, contents: String },
+    DeleteFile { path: PathBuf },
+    UpdateFile {
+        path: PathBuf,
+        move_path: Option<PathBuf>,
+        chunks: Vec<UpdateFileChunk>,
+    },
+}
+
+pub struct UpdateFileChunk {
+    pub change_context: Option<String>,    // e.g., "fn main() {"
+    pub old_lines: Vec<String>,             // Lines to replace
+    pub new_lines: Vec<String>,             // Replacement lines
+    pub context_line_indices: Vec<(usize, usize)>,  // Marked context
+    pub is_end_of_file: bool,               // EOF tolerance
+}
+```
+
+**Execution**: 
+- Parsed via `parse_patch()` → returns `ApplyPatchArgs`
+- Streamed via `StreamingPatchParser` for incremental parsing
+- Applied via `ApplyPatchFileUpdate::apply_to_filesystem()`
+- File updates normalized to LF or preserve original line endings (config: `ApplyPatchFileUpdateMode`)
+
+### Tool Call Parsing & Dispatch
+
+**Router**: [core/src/tools/router.rs](codex-rs/core/src/tools/router.rs) `ToolRouter`
+
+```
+ResponseItem::FunctionCall
+    ↓
+ToolRouter::build_tool_call() → ToolCall { tool_name, call_id, payload }
+    ↓
+Lookup in registry by tool_name (MCP, builtin, dynamic)
+    ↓
+Match ToolPayload (Function, ToolSearch, etc.)
+    ↓
+ToolOrchestrator::run_attempt()
+    ├─ Approval check (with_cached_approval)
+    ├─ Sandbox selection
+    ├─ Execute tool
+    ├─ Retry with escalated sandbox on denial
+    └─ Return ToolOutput
+```
+
+**Parallel tool calls**: If `tool_supports_parallel(call)`, multiple calls execute concurrently via [parallel.rs](codex-rs/core/src/tools/parallel.rs)
+
+---
+
+## 8. PROMPT / SYSTEM MESSAGE STRATEGY
+
+### Prompt Storage
+
+**Location**: [codex-rs/prompts/](codex-rs/prompts/)
+
+```
+prompts/src/
+├── lib.rs              # Re-exports
+├── compact.rs          # SUMMARIZATION_PROMPT
+├── goals.rs            # budget_limit_prompt, continuation_prompt
+├── permissions_instructions.rs  # ApprovalPromptContext, PermissionsInstructions
+├── realtime.rs         # BACKEND_PROMPT, START_INSTRUCTIONS, END_INSTRUCTIONS
+├── review_exit.rs      # render_review_exit_success
+└── review_request.rs   # REVIEW_PROMPT, review_prompt()
+```
+
+**Embedding**: Prompts are compiled via `include_str!()` from [templates/](codex-rs/prompts/templates/)
+
+### Key Prompts (Verbatim Samples)
+
+**Backend System Prompt** ([realtime/backend_prompt.md](codex-rs/prompts/templates/realtime/backend_prompt.md)):
+
+```markdown
+You are Codex, OpenAI's code agent that runs on the user's machine.
+You help users write, understand, test, and improve code.
+
+You can execute shell commands and modify files. You have access to:
+- bash: Execute shell commands
+- apply_patch: Modify files using unified diff format
+- view_image: Display images
+- request_user_input: Ask the user for input
+- ...MCP tools from the user's environment...
+
+[More instructions about error handling, when to request approval, etc.]
+```
+
+**Start Instructions** ([realtime/realtime_start.md](codex-rs/prompts/templates/realtime/realtime_start.md)):
+- Prepended to first turn of session
+- Sets user goal context
+
+**End Instructions** ([realtime/realtime_end.md](codex-rs/prompts/templates/realtime/realtime_end.md)):
+- Appended to last turn
+- Concludes session
+
+**Review Prompt** ([review_request/review_request.rs](codex-rs/core/src/prompts/review_request.rs)):
+- Used by approval review (Guardian)
+- Asks model to approve/deny tool execution
+
+**Permissions Instructions** ([permissions_instructions.rs](codex-rs/core/src/prompts/permissions_instructions.rs)):
+- Injected when tool needs approval
+- Explains sandbox restrictions
+
+### Prompt Composition
+
+**Flow**:
+```
+BACKEND_PROMPT
+  ↓
+Injected context fragments:
+  - File contents (bounded, max 10k tokens each)
+  - Memories from previous sessions
+  - Project AGENTS.md (agent role definitions)
+  - Skills interface docs
+  ↓
+Message history (compacted or full)
+  ↓
+START_INSTRUCTIONS (if first turn)
+  ↓
+User message
+  ↓
+[Model responds]
+  ↓
+END_INSTRUCTIONS (if final turn)
+```
+
+---
+
+## 9. MEMORY & CONTEXT MANAGEMENT
+
+### Session History
+
+**Managed by**: [codex-rs/core/src/session/](codex-rs/core/src/session/)
+
+- **Current turn**: `TurnContext` (message history + context window state)
+- **Past turns**: Rollout-based append-only log (SQLite)
+- **Resume**: `ThreadStore::resume_thread()` rehydrates from state DB
+
+### Context Fragments
+
+**Defined in** [core/src/context/](codex-rs/core/src/context/):
+
+```rust
+pub trait ContextualUserFragment {
+    fn to_context(&self) -> String;
+    fn token_estimate(&self) -> usize;  // Hard cap check
+    fn priority(&self) -> u32;
+}
+```
+
+**Fragment types**:
+- File contents
+- Project structure (via `find_nearest_ancestor_with_markers`)
+- Memories (prior session summaries)
+- Skills interface docs
+- Git info
+
+**Constraints** ([AGENTS.md](AGENTS.md#model-visible-context)):
+1. No history rewrite — built up incrementally
+2. Avoid frequent context changes (cache misses)
+3. All injected items bounded; hard cap 10k tokens per item
+4. No items > 10k tokens without manual review
+
+### Memory Subsystem
+
+**Crates**:
+- [codex-rs/memories/read](codex-rs/memories/read/) — Read stored memories
+- [codex-rs/memories/write](codex-rs/memories/write/) — Write/consolidate memories
+- Extension: [ext/memories/](codex-rs/ext/memories/) — Memory extraction plugin
+
+**Workflow**:
+- After each turn, extract salient facts (model-based)
+- Consolidate into session memory (stored in `~/.codex/memories/`)
+- Inject relevant memories into next session
+
+### Context Compaction
+
+**Types**:
+1. **Inline compaction** ([compact.rs](codex-rs/core/src/compact.rs)): Synchronous, same model
+2. **Remote compaction** ([compact_remote.rs](codex-rs/core/src/compact_remote.rs)): Via Responses API, background
+3. **Remote v2** ([compact_remote_v2.rs](codex-rs/core/src/compact_remote_v2.rs)): Newer protocol with `compaction_trigger` items
+
+**Trigger**:
+- Token budget exceeded
+- Manual user request
+- Session idle timeout
+
+---
+
+## 10. PLANNING SUBSYSTEM
+
+**Not an explicit planner crate**. Instead:
+
+1. **Plan tool** ([plan.rs](codex-rs/core/src/tools/handlers/plan.rs)):
+   - Model outputs structured plan
+   - Parsed from `## Plan` section in assistant text
+   - Stored as `PlanItem` in turn output
+
+2. **Plan stream parsing** ([AssistantTextStreamParser](codex-rs/core/src/stream_events_utils.rs)):
+   - Extracts `ProposedPlanSegment` from streaming text
+   - Emits `PlanDeltaEvent` to UI
+
+3. **Goal tracking**:
+   - User goal stored in session context
+   - Model kept aligned via system instructions
+   - Goal updates via `objective_updated_prompt()`
+
+---
+
+## 11. SUB-AGENTS / DELEGATION
+
+### Spawn Tool
+
+**Handler**: [multi_agents.rs](codex-rs/core/src/tools/handlers/multi_agents.rs)
+
+**Arguments**:
+```json
+{
+  "agent_name": "string",              // Sub-agent name
+  "role": "string",                    // Agent role (from AGENTS.md)
+  "goal": "string",                    // Sub-task goal
+  "model": "string",                   // Optional model override
+  "fork_mode": "full_history" | "last_n_turns",
+  "fork_turns": "number"               // For last_n_turns
+}
+```
+
+**Data Flow**:
+```
+spawn_agent call
+    ↓
+AgentControl::spawn_from_parent()
+    ├─ Resolve role config (from AGENTS.md or config.toml)
+    ├─ Create new ThreadId (DAG edge tracking)
+    ├─ Fork history per fork_mode
+    ├─ Initialize sub-agent Session
+    │   └─ Shared AgentControl (session-scoped registry)
+    └─ Return agent thread handle
+    
+Sub-agent runs autonomously
+    ├─ Receives parent context
+    ├─ Can spawn further sub-agents
+    └─ Reports results via send_message
+```
+
+### Inter-Agent Communication
+
+**Tools**:
+- `send_message`: Parent/child message passing
+- `followup_task`: Delegate sub-task to agent
+
+**Registry**: Per-session `AgentRegistry` ([agent/registry.rs](codex-rs/core/src/agent/registry.rs))
+- Tracks live agent threads by name
+- Manages agent lifecycle (spawn, message, complete)
+
+### AGENTS.md Convention
+
+**Purpose**: Codex-specific agent role definitions
+
+**Structure**:
+```toml
+[agents.researcher]
+description = "Researches and summarizes information"
+nickname_candidates = ["research", "info-bot"]
+config_file = "agents/researcher.toml"
+
+[agents.executor]
+description = "Executes tasks with shell commands"
+```
+
+**Usage**: When spawning, model looks up role to determine:
+- Initial system prompt
+- Tool availability profile
+- Model selection
+- Nickname suggestions
+
+---
+
+## 12. HUMAN-IN-THE-LOOP & APPROVAL MODES
+
+### Approval Policy
+
+**Configuration** ([core/config.schema.json](codex-rs/core/config.schema.json)):
+
+```toml
+[approvals]
+policy = "suggest" | "auto_edit" | "auto" | "manual"
+reviewer = "guardian" | "app_server"
+```
+
+**Modes**:
+
+| Mode | Behavior |
+|------|----------|
+| `suggest` | Model proposes changes; user reviews before execution |
+| `auto_edit` | Auto-apply non-interactive edits (file changes); ask for shell |
+| `auto` | Execute everything without prompting (high trust) |
+| `manual` | Always ask before any tool use (low trust, dev mode) |
+
+### Approval Flow
+
+**Orchestrator**: [tools/orchestrator.rs](codex-rs/core/src/tools/orchestrator.rs)
+
+```
+Tool call received
+    ↓
+with_cached_approval():
+    ├─ Check if key already ApprovedForSession → skip
+    ├─ Else fetch() → approval decision
+    └─ Cache for future same-key calls
+    
+Approval decision:
+    ├─ ApprovedForSession → Execute
+    ├─ ApprovedOnce → Execute + ask again next time
+    ├─ Denied → Skip tool call (return error)
+    └─ DeferredForNetworkApproval → Continue after network check
+```
+
+### Guardian Review Framework
+
+**Location**: [core/src/guardian/](codex-rs/core/src/guardian/)
+
+- Central approval review system
+- Supports multiple reviewers:
+  - User (TUI popup)
+  - Hook system (custom scripts)
+  - Model (automatic review via `gpt-5.6-luna`)
+
+**Review context injected**:
+- Tool name & arguments
+- Current user goal
+- File changes preview
+- Security risk score
+
+### TUI Approval UI
+
+**Components** ([bottom_pane/](codex-rs/tui/src/bottom_pane/)):
+
+- `ApprovalRequest`: Popup showing tool details
+- `ExecApprovalRequest`: Shell command preview + "Approve", "Deny", "Edit" buttons
+- `ApplyPatchApprovalRequest`: Diff preview + approval
+- `McpToolCall`: MCP tool invocation with info from MCP server
+
+**Ctrl-C Behavior**: Interrupts current turn; user can resume
+
+---
+
+## 13. SANDBOXING / SAFETY
+
+### Sandbox Abstraction
+
+**Trait**: [core/src/tools/sandboxing.rs](codex-rs/core/src/tools/sandboxing.rs)
+
+```rust
+pub trait Sandboxable {
+    fn sandbox(&self) -> SandboxType;
+    fn permissions(&self) -> SandboxPermissions;
+}
+
+pub struct SandboxAttempt {
+    pub sandbox: SandboxType,           // None, LinuxLandlock, Linux, Windows, Seatbelt
+    pub permissions: SandboxPermissions,
+    pub exec_server_permissions: ExecServerPermissions,
+    pub enforce_managed_network: bool,
+    // ...
+}
+```
+
+### Platform-Specific Implementations
+
+**macOS** ([core/src/sandboxing/](codex-rs/core/src/sandboxing/)):
+- Seatbelt (`/usr/bin/sandbox-exec`) + profile
+- File read/write whitelisting
+- Network restrictions
+
+**Linux** ([linux-sandbox/src/lib.rs](codex-rs/linux-sandbox/src/lib.rs)):
+- **Landlock** (if kernel ≥ 6.2): Filesystem ACLs in process
+- **Bubblewrap** (bwrap): Container-like filesystem isolation
+- **seccomp**: System call filtering
+- **no_new_privs**: Prevent privilege escalation
+
+**Windows** ([windows_sandbox.rs](codex-rs/core/src/windows_sandbox.rs) + [windows-sandbox-rs/](codex-rs/windows-sandbox-rs/)):
+- **RestrictedToken** (default): Limited privileges
+- **Elevated** (opt-in): Admin privileges for build tools
+- Filesystem restrictions via handle restrictions
+- Registry read-only
+
+### Permission Model
+
+**SandboxPermissions**:
+```rust
+pub struct SandboxPermissions {
+    pub read_paths: Vec<FileSystemPath>,
+    pub write_paths: Vec<FileSystemPath>,
+    pub execute: bool,
+    pub network: NetworkPolicy,
+}
+```
+
+**Defaults**:
+- Read: CWD + project roots (auto-detected)
+- Write: CWD
+- Execute: Enabled (unless escalated)
+- Network: Blocked by default (managed network proxy when needed)
+
+### Network Approval
+
+**Deferred**: [tools/network_approval.rs](codex-rs/core/src/tools/network_approval.rs)
+
+```
+Tool requests network access
+    ↓
+DeferredNetworkApproval spawned
+    ├─ User notified
+    ├─ Tool execution paused
+    └─ Awaits network approval
+    
+Approval granted
+    ├─ Managed network proxy enabled
+    └─ Tool resumes with network access
+```
+
+### Process Hardening
+
+**Crate**: [codex-rs/process-hardening/](codex-rs/process-hardening/)
+- `no_new_privs`
+- Core dump disabling
+- ASLR enforcement
+- Seccomp rules
+
+---
+
+## 14. OBSERVABILITY & COST TRACKING
+
+### Logging & Tracing
+
+**Framework**: `tracing` + `opentelemetry`
+
+**Instrumentation**:
+```rust
+#[tracing::instrument(level = "debug", skip_all, err)]
+async fn run_turn(sess: Arc<Session>, ...) -> CodexResult<...> { ... }
+```
+
+**Levels**: trace, debug, info, warn, error
+**Output**: Structured logs to stderr; OTLP export to server (if configured)
+
+### Metrics
+
+**Emitted via** [codex_analytics](codex-rs/core/) crate:
+
+| Metric | Purpose |
+|--------|---------|
+| `codex.turn.ttft` | Time-to-first-token (latency) |
+| `codex.tool.*.duration` | Tool execution time |
+| `codex.approval.requested` | Approval flow metrics |
+| `codex.sandbox.type` | Sandbox type distribution |
+| `codex.token.usage` | Input/output token counts |
+| `codex.compaction.reason` | Compaction trigger type |
+
+**Tagging**: Tool name, approval mode, sandbox type, error category
+
+### Cost Tracking
+
+**Responses API metadata**: [responses_metadata.rs](codex-rs/core/src/responses_metadata.rs)
+
+```rust
+pub struct CodexResponsesMetadata {
+    pub usage: ResponseUsage {
+        pub input_tokens: u32,
+        pub output_tokens: u32,
+        pub cache_read_tokens: u32,
+        pub cache_creation_tokens: u32,
+    }
+}
+```
+
+**Aggregation**:
+- Per-turn cost
+- Per-session cumulative
+- Exported to analytics backend
+
+### Debugging & Traces
+
+**Stored in** `~/.codex/rollouts/`
+
+**Replay**:
+```bash
+codex replay --rollout <session_id>
+```
+
+**Dump format**: CBOR + JSON (lossy summary)
+
+---
+
+## 15. EVALUATION / TESTING
+
+### Integration Tests
+
+**Framework**: [core_test_support](codex-rs/core/tests/common/)
+
+**Builder**: `TestCodexBuilder::build_with_auto_env()`
+
+**SSE Mocking**:
+```rust
+let mock = responses::mount_sse_once(&server, responses::sse(vec![
+    responses::ev_response_created("resp-1"),
+    responses::ev_function_call(call_id, "shell", &args_json),
+    responses::ev_completed("resp-1"),
+])).await;
+
+codex.submit(Op::UserTurn { ... }).await?;
+
+let request = mock.single_request();
+assert_eq!(request.function_call_output(call_id).status, "success");
+```
+
+**Test location**: [core/suite/](codex-rs/core/suite/) (end-to-end tests)
+
+### Snapshot Tests
+
+**Framework**: `insta`
+
+**TUI snapshots**: [tui/src/snapshot/](codex-rs/tui/src/snapshot/)
+
+**Workflow**:
+```bash
+just test -p codex-tui          # Generate .snap.new files
+cargo insta show -p codex-tui <path>  # Review
+cargo insta accept -p codex-tui # Accept changes
+```
+
+**Requirement**: Any UI change must update snapshots (part of PR review)
+
+### Benchmarks
+
+**Framework**: `divan`
+
+**Run**: `just bench` (or `just bench-smoke` for single iteration)
+
+---
+
+## 16. CONFIGURATION
+
+### Config File
+
+**Location**: `~/.codex/config.toml`
+
+**Schema**: [core/config.schema.json](codex-rs/core/config.schema.json) (auto-generated from Rust types)
+
+**Key sections**:
+
+```toml
+[model]
+provider = "chatgpt"  # or "amazon-bedrock", "ollama"
+model = "gpt-4-turbo"
+reasoning_effort = "medium"  # For o3/o4
+
+[approvals]
+policy = "suggest"
+reviewer = "guardian"
+
+[permissions]
+cwd = "/home/user/project"
+read_paths = ["/home/user", "/tmp"]
+write_paths = ["/home/user/project"]
+windows_sandbox_mode = "unelevated"
+
+[features]
+multi_agent_v2 = true
+linux_sandbox = true
+web_search = true
+
+[memories]
+generate_memories = true
+consolidate = true
+
+[agents]
+enabled = true
+max_depth = 3
+
+[skills]
+system_skills_enabled = true
+```
+
+### Environment Variables
+
+**Notable**:
+- `CODEX_SANDBOX_NETWORK_DISABLED=1`: Disables network (test mode)
+- `CODEX_SANDBOX=seatbelt`: Indicates Seatbelt is active
+- `CODEX_HOME`: Override default `~/.codex`
+- `CODEX_INSTALLER_USE_RELEASES_OPENAI_COM`: Installer config
+
+### Auth Config
+
+**Stored in**: `~/.codex/auth.toml`
+
+**Supported**:
+- ChatGPT account (OAuth via browser)
+- API key (manual setup)
+- Device code (CLI flow)
+- Workload identity (enterprise)
+
+---
+
+## 17. ENTRY POINTS & MODES
+
+### CLI Subcommands
+
+**Main TUI**: `codex`
+- Interactive chat mode with approval UI
+- Spawns app-server daemon if needed
+
+**App**: `codex app` (macOS/Windows only)
+- Desktop Electron app wrapper
+- Calls app-server over WebSocket
+
+**MCP Server**: `codex mcp`
+- Runs Codex as MCP server for external clients
+- [mcp_cmd.rs](codex-rs/cli/src/mcp_cmd.rs)
+
+**Login**: `codex login`
+- Auth setup flow
+- Supports ChatGPT, API key, device code
+
+**Doctor**: `codex doctor`
+- System diagnostics
+- Sandbox availability check, Python version, etc.
+
+**Apply**: `codex apply <patch_file>`
+- Standalone patch application (no agent)
+
+**Other**:
+- `codex login status` — Check auth
+- `codex logout` — Clear credentials
+- `codex plugin list` — MCP plugins
+- `codex queue` — Background job queue
+
+### App Server (Daemon Mode)
+
+**Bootstrap** ([app-server-daemon/](codex-rs/app-server-daemon/)):
+```rust
+pub enum LifecycleCommand {
+    Start,    // Start daemon
+    Stop,     // Stop daemon
+    Status,   // Check status
+}
+```
+
+**Transport** ([app-server/src/transport/](codex-rs/app-server/src/transport/)):
+- **Unix socket**: IPC (macOS, Linux)
+- **Named pipe**: IPC (Windows)
+- **WebSocket**: Remote (desktop app)
+- **stdio**: Process replacement
+
+**JSON-RPC 2.0** ([app-server-protocol/src/protocol/](codex-rs/app-server-protocol/src/protocol/)):
+- v1: Legacy API
+- v2: Current (cursor pagination, camelCase fields)
+
+**Methods** (v2):
+- `thread/start` — Create new session
+- `thread/send_turn` — Submit user message
+- `thread/read` — Get thread state
+- `thread/list` — List threads
+- `thread/resume` — Resume archived thread
+- `config/read` — Read config value
+- `config/write` — Update config
+- `config/list` — List all config
+
+---
+
+## 18. NOTABLE IDIOMS & PATTERNS
+
+### 1. Apply-Patch Format
+- **Distinctive**: `*** Begin Patch` / `*** End Patch` markers
+- **Advantage**: Streaming-friendly (model can output incrementally)
+- **Limitation**: No standard patch syntax; custom parser required
+
+### 2. Approval Caching
+- **Key serialization**: JSON-based cache keys
+- **Session-scoped**: Cleared when session ends
+- **Re-approval**: Only if different key (different args/context)
+
+### 3. Unified Exec Abstraction
+- Single tool (`bash`/`shell`) handles:
+  - Direct shell commands
+  - TTY mode (interactive)
+  - Env-specific execution (via exec-server)
+  - Sandbox negotiation
+
+### 4. Responses API (not Chat Completions)
+- **Advantage**: Streaming SSE + tool_choice in single response
+- **Streaming**: Incremental assistant text + function calls
+- **No turn-by-turn role switching**: Items flow one-way
+
+### 5. Rollout-Based Persistence
+- **Append-only**: Each turn is immutable
+- **Resume-friendly**: Replay to reconstruct state
+- **Archival**: Old sessions moved to archive dir
+
+### 6. MCP as First-Class Feature
+- **Discovery**: MCP servers probed at session start
+- **Tool exposure**: MCP tools namespaced (e.g., `brave-search/search`)
+- **Elicitation**: MCP servers can ask user questions via prompts
+
+### 7. Landlock Preference (Linux)
+- **Default**: Use Landlock if kernel ≥ 6.2
+- **Fallback**: bwrap for older kernels
+- **Legacy flag**: `use_legacy_landlock` for testing
+
+### 8. Argument Comment Lint
+- [AGENTS.md](AGENTS.md): Exact `/*param_name*/` comments for opaque args
+  ```rust
+  foo(/*count*/ 3, /*enabled*/ false)  // ✓ Good
+  foo(3, false)                         // ✗ Bad
+  ```
+
+### 9. Large Module Size Constraint
+- **Target**: < 500 LoC per module
+- **Limit**: ~ 800 LoC before forced refactor
+- **Rationale**: Code locality + navigability
+
+### 10. AGENTS.md Code Review Rules
+- **Breaking changes**: Search for external integrations
+- **Test-driven**: Features that change agent logic MUST add integration tests
+- **Change size**: 800 line limit (500 for complex logic)
+
+---
+
+## 19. DATA FLOW DIAGRAM (Textual)
+
+### Single User Message → LLM → Tool Call → Sandbox → Result → User Output
+
+```
+User: "ls -la /home/user/project"
+  │
+  ├─→ [Session::receive_input]
+  │    └─→ TurnInput::Message
+  │
+  ├─→ [run_turn]
+  │    ├─ Pre-sampling compaction (if needed)
+  │    ├─ Resolve MCP servers & plugins
+  │    │
+  │    ├─ [Client::sample]
+  │    │  └─ POST /v1/responses with:
+  │    │     {
+  │    │       "messages": [ ... history ... ],
+  │    │       "tools": [ { "type": "function", "function": { ... } } ]
+  │    │     }
+  │    │
+  │    ├─ [Stream SSE]
+  │    │  response_created
+  │    │  content_block_start (type: text)
+  │    │  content_block_delta (delta: { "type": "text_delta", "text": "Listing..." })
+  │    │  content_block_stop
+  │    │  content_block_start (type: tool_use)
+  │    │  content_block_delta (delta: { "type": "tool_use_delta", "index": 0, "input": "{\"command\": \"ls -la /home/user/project\"}" })
+  │    │  content_block_stop
+  │    │  message_stop
+  │    │
+  │    ├─ [Parse response items]
+  │    │  ├─ AssistantText → Display to user
+  │    │  └─ FunctionCall (tool_use) → Extract tool_name="bash", args={"command": "ls -la /home/user/project"}
+  │    │
+  │    ├─ [Tool Routing]
+  │    │  └─ ToolRouter::tool_runtime("bash") → UnifiedExecRuntime
+  │    │
+  │    ├─ [Tool Orchestration]
+  │    │  ├─ with_cached_approval:
+  │    │  │   ├─ Check approval cache for key=(tool_name, args_hash)
+  │    │  │   ├─ If not approved → request approval
+  │    │  │  ├─ User reviews in TUI bottom pane
+  │    │  │  └─ Decision: ApprovedForSession | Denied
+  │    │  │
+  │    │  ├─ [Sandbox Selection]
+  │    │  │  ├─ Analyze command for safety
+  │    │  │  ├─ Select SandboxType (LinuxLandlock, Seatbelt, Disabled, etc.)
+  │    │  │  └─ Determine permissions (read_paths, write_paths)
+  │    │  │
+  │    │  ├─ [Sandbox Attempt #1]
+  │    │  │  ├─ Execute command in selected sandbox
+  │    │  │  │   ├─ (Linux) codex-linux-sandbox wrapper
+  │    │  │  │   │   ├─ Set no_new_privs + seccomp
+  │    │  │  │   │   ├─ Landlock rules (if enabled)
+  │    │  │  │   │   ├─ bwrap filesystem mount
+  │    │  │  │   │   └─ Fork+exec process
+  │    │  │  │   │
+  │    │  │  │   ├─ (macOS) Seatbelt profile
+  │    │  │  │   │   ├─ Generate profile from permissions
+  │    │  │  │   │   ├─ /usr/bin/sandbox-exec -p <profile> bash -c "ls -la ..."
+  │    │  │  │   │   └─ Enforce file ACLs
+  │    │  │  │   │
+  │    │  │  │   └─ (Windows) RestrictedToken
+  │    │  │  │       ├─ CreateProcessAsUser with reduced token
+  │    │  │  │       └─ Handle whitelisting
+  │    │  │  │
+  │    │  │  └─ Wait for process exit + capture stdout/stderr
+  │    │  │
+  │    │  ├─ [Result Capture]
+  │    │  │  ├─ status: success | denied | error
+  │    │  │  ├─ stdout: "drwxr-xr-x 4 user ..."
+  │    │  │  ├─ stderr: ""
+  │    │  │  └─ exit_code: 0
+  │    │  │
+  │    │  └─ [Retry Logic]
+  │    │     ├─ If denied in high sandbox
+  │    │     └─ Escalate and re-attempt (already approved, skip approval)
+  │    │
+  │    ├─ [Response Processing]
+  │    │  ├─ Convert to ResponseInputItem::ToolResult
+  │    │  ├─ Record in turn history
+  │    │  ├─ Emit ToolResultEvent to TUI
+  │    │  │
+  │    │  └─ [Send Result Back to Model]
+  │    │     POST /v1/responses {
+  │    │       "messages": [...history...],
+  │    │       "tool_results": [{
+  │    │         "type": "tool_result",
+  │    │         "tool_call_id": <id>,
+  │    │         "content": "drwxr-xr-x 4 user ..."
+  │    │       }]
+  │    │     }
+  │    │
+  │    ├─ [Next Sampling]
+  │    │  ├─ Model may respond with:
+  │    │  │  ├─ More tool calls → repeat loop
+  │    │  │  └─ Final assistant message → done
+  │    │  │
+  │    │  └─ If final message:
+  │    │     ├─ Post-sampling compaction (if needed)
+  │    │     └─ Record in rollout
+  │    │
+  │    └─ [Return to User]
+  │       ├─ Display final message
+  │       ├─ Show turn summary
+  │       └─ Ready for next turn
+  │
+  └─→ [TUI Update]
+       ├─ Render streaming text
+       ├─ Show approval prompts
+       ├─ Refresh tool results
+       └─ Display final summary
+```
+
+---
+
+## 20. WEAKNESSES & GAPS
+
+### Observed Limitations
+
+1. **Apply-Patch Format Brittleness**
+   - Custom grammar; not standard unified diff
+   - No formal spec published; implementation is source of truth
+   - Model hallucinations on patch format are common
+
+2. **Single-Model Reasoning**
+   - No multi-model ensemble (e.g., o1 for planning + gpt-4 for execution)
+   - Reasoning models (o3/o4) not explicitly leveraged for step decomposition
+
+3. **Sandbox Fragmentation**
+   - Linux: Three modes (none, Landlock, bwrap) — complexity
+   - Windows: RestrictedToken gaps (some tools need elevation)
+   - macOS: Seatbelt profiles manually maintained
+
+4. **Context Compaction Quality**
+   - Model-based summarization prone to information loss
+   - No human-in-the-loop review of compacted history
+   - Remote compaction async; timing issues possible
+
+5. **Tool Approval UX**
+   - Approval modal can be intrusive
+   - No "approve all for this goal" mode
+   - Sandboxing reduces need, but modal still shows
+
+6. **MCP Tool Schema Limits**
+   - No support for streaming tool results (yet)
+   - Tool elicitation (MCP asking user) is deferred/async
+   - No standardized MCP-to-Codex resource linking
+
+7. **Multi-Agent Coordination**
+   - No built-in deadlock detection
+   - Message ordering not guaranteed across concurrent agents
+   - No global state (all per-session)
+
+8. **Limited Observability into Agent Reasoning**
+   - No structured trace of model's reasoning process
+   - o3/o4 reasoning output not captured/analyzed
+   - Cost breakdown per reasoning vs. execution unclear
+
+9. **Config Overload**
+   - 150+ config options in schema
+   - No UI to guide config selection
+   - Breaking changes in config structure harder to migrate
+
+10. **Lack of Formal Agent Specification**
+    - Agent behavior is implicit in code + prompts
+    - No formal semantics (e.g., when does agent terminate?)
+    - Rollout replay is close, but not ground truth
+
+---
+
+## SUMMARY TABLE
+
+| Aspect | Implementation |
+|--------|----------------|
+| **Agent Type** | Hierarchical DAG (multi-agent with parent-child spawning) |
+| **Main Loop** | Streaming Responses API (not Chat Completions) |
+| **Approval Model** | Session-cached Guardian review + TUI prompts |
+| **Tool System** | Registry-based; MCP + builtins + dynamic |
+| **Apply-Patch** | `*** Begin Patch` format; unified diff chunks |
+| **Sandboxing** | Platform-specific (Landlock+bwrap, Seatbelt, RestrictedToken) |
+| **Memories** | Model-extracted; stored in `~/.codex/memories/` |
+| **State Persistence** | Rollout-based append-only (SQLite) |
+| **Configuration** | `~/.codex/config.toml` with 150+ options |
+| **CLI** | Rust TUI (ratatui) + app-server JSON-RPC daemon |
+| **Skills System** | System skills (embedded) + user skills (disk-based) |
+| **MCP Integration** | First-class; tools auto-discovered from servers |
+| **Observability** | OpenTelemetry traces + analytics events |
+| **Build System** | Bazel + Cargo (dual) |
+| **Languages** | Rust (100+ crates) + TypeScript (minimal) |
+
+---
+
+**Report compiled:** 2026-08-23  
+**Scope:** `/workspaces/literate-winner/reference/codex` (Codex CLI v0.0.0, active development)  
+**Focus:** Agent orchestration, tool system, sandbox model, approve flow, apply-patch format

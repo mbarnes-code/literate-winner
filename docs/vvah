@@ -1,0 +1,1382 @@
+Now I'll compile my comprehensive analysis report based on the thorough exploration I've completed:
+
+---
+
+# VISA Vulnerability Agentic Harness (VVAH) — Comprehensive Architectural Analysis
+
+## 1. Project Identity & Purpose
+
+**What it is:** VVAH is Visa's open-source agentic SAST (Static Application Security Testing) pipeline for autonomous vulnerability discovery, remediation, and validation, built on learnings from [Project Glasswing](https://www.anthropic.com/glasswing) (Anthropic's AI-assisted vulnerability research initiative).
+
+**Problem domain:** Vulnerability triage for software security. The project explicitly addresses the bottleneck in AI-assisted vulnerability management: not discovery speed, but **Mean Time to Adapt (MTTA)** — elapsed time from AI-discovered exploitability to a validated fix in production. Key innovation: multi-agent deterministic voting + threat modeling + structured triage artifacts to compress triage lifecycle.
+
+**Core files:**
+- [README.md](README.md#L1-L70) — feature overview, 4-phase pipeline description
+- [AGENTS.md](AGENTS.md#L1-L40) — operating manual for AI agents
+- [docs/architecture.md](docs/architecture.md#L1-L100) — module layout and data flow diagram
+- [vvaharness/\_\_init\_\_.py](vvaharness/__init__.py) — version 1.2.0
+
+---
+
+## 2. Languages & Runtime
+
+**Primary language:** Python 3.11+
+
+**Build system & package manager:** setuptools + pip
+
+**Minimum runtime version:** `requires-python = ">=3.11"` ([pyproject.toml](pyproject.toml#L20))
+
+**Entry point:** CLI binary via setuptools: `vvaharness` command ([pyproject.toml](pyproject.toml#L78))
+
+**Supported code analysis languages:** Python, Java, C#, JavaScript/TypeScript, Go, C/C++, Ruby, PHP, Kotlin, Scala, Rust, SQL, YAML/JSON (Terraform, Docker). Language hints and specialist modes defined in [vvaharness/lang/](vvaharness/lang/).
+
+---
+
+## 3. Dependencies
+
+**Key dependencies from [pyproject.toml](pyproject.toml#L23-L46):**
+
+| Dependency | Version | Purpose |
+|---|---|---|
+| **anthropic** | ≥0.107.0 | Anthropic SDK for S1–S9 LLM calls |
+| **openai** | ≥2.41.0 | OpenAI-compatible backend (S1–S9, configurable) |
+| **claude-agent-sdk** | ≥0.2.87 | Claude Agent SDK for S11 validation (mutating ops via Read/Edit/Write) |
+| **deepagents** | ≥0.6.8, <0.7 | DeepAgents/LangGraph runtime for S10 remediation + S11 validation (post-scan roles) |
+| **langchain** | ≥0.3.0 | LLM orchestration primitives |
+| **langchain-anthropic** | ≥0.3.0 | Anthropic provider for LangChain |
+| **langchain-openai** | ≥0.3.0 | OpenAI provider for LangChain |
+| **langgraph** | ≥0.3.0 | Graph-based agentic orchestration (used by validation/remediation) |
+| **pydantic** | ≥2.13.4 | Data validation & serialization |
+| **pydantic-settings** | ≥2.14.1 | Config management |
+| **tree-sitter** | ≥0.26.0, <0.27 | Static analysis: AST parsing & callgraph construction (S0/S1) |
+| **tree-sitter-language-pack** | ≥1.14.0, <2 | Language parsers for tree-sitter |
+| **httpx** | ≥0.28.1 | HTTP client (SDK backend, TLS cert handling) |
+| **PyYAML** | ≥6.0.3 | Config file parsing |
+| **python-dotenv** | ≥1.2.2 | .env file loading |
+
+**LLM provider abstraction:** Vendor-neutral via a 3-way dispatcher:
+- `via: cli` — `claude` CLI subprocess (Auth: Claude Code OAuth token)
+- `via: sdk` — Anthropic Python SDK (Auth: `ANTHROPIC_SDK_API_KEY`)
+- `via: openai` — OpenAI Chat Completions endpoint (Auth: `OPENAI_API_KEY`)
+- `via: deepagents` — DeepAgents/LangGraph harness for S10/S11 (Auth: `ANTHROPIC_API_KEY` or `OPENAI_API_KEY`)
+
+**Dev dependencies:** pytest, pyflakes, ruff, pyright
+
+---
+
+## 4. Top-Level Directory Layout
+
+```
+vvaharness/                          # Main package
+├── cli.py                           # Entry point: setup, doctor, estimate, scan, remediate, validate
+├── orchestrator/                    # Pipeline orchestrator
+│   ├── entry.py                    # Argparse + CLI main() dispatcher
+│   ├── scan.py                     # Single-repo scan driver (S0–S11)
+│   ├── batch.py                    # Batch mode: clone/group by app
+│   ├── checkpoints.py              # Run state persistence (SQLite, no pickle)
+│   ├── store.py                    # SQLite state store (vvaharness.db)
+│   ├── preflight.py                # Backend credential/connectivity probes
+│   ├── enrich_findings.py           # CVSS/CMDB post-processing
+│   └── cmdb.py                     # App profile lookup (deployment context)
+├── agentdoc.py                      # AGENTS.md / CLAUDE.md text
+├── manifest.py                      # Run-level run_manifest.json
+├── models.py                        # Pydantic contracts (ContextPackage, Finding, FinalReport, etc.)
+├── config/                          # Config loading + env expansion
+│   ├── __init__.py                 # load() function, Config wrapper
+│   └── profiles/                   # Bundled profiles (default/sdk/full/taint)
+├── pipeline/stages/                 # Analysis stages S0–S8 (S11 in validation/)
+│   ├── s0_seed.py                  # Static taint seed (optional)
+│   ├── s1_preprocess.py            # Repo inventory + AST mapping
+│   ├── s1_autoexclude.py           # Structured exclusion filtering
+│   ├── s2_threatmodel.py           # STRIDE threat model (deterministic + LLM)
+│   ├── s3_decompose.py             # Strategist: risk-ranked chunk list
+│   ├── s4_deepdive.py              # Deep analysis: find candidates (multi-run voting)
+│   ├── s5_prefilter.py             # Deterministic FP filtering
+│   ├── s6_verify.py                # Adversarial verifier: TRUE/FALSE_POSITIVE + CVSS
+│   ├── s7_dedup.py                 # Dedup + semantic collapse
+│   ├── s8_chain.py                 # Chain synthesis + final severity
+│   ├── s11_validate.py             # Thin wrapper to validation package
+│   └── callgraph_engine/           # Tree-sitter static seed
+├── backends/                        # LLM transport layer
+│   ├── llm.py                      # Dispatcher (resolve + route by `via:`)
+│   ├── claude_cli.py               # Claude CLI subprocess backend
+│   ├── sdk.py                      # Anthropic SDK backend
+│   ├── agent_sdk.py                # Claude Agent SDK (mutating S10 fix mode)
+│   ├── oai.py                      # OpenAI-compatible backend
+│   ├── localtools.py               # Sandboxed Read/Glob/Grep (SDK+OpenAI)
+│   ├── harness/                    # Post-scan harness abstractions
+│   └── _tls.py                     # TLS cert handling
+├── remediation_agent/               # S10 (Remediation Agent)
+│   ├── remediate.py                # Main remediation orchestrator
+│   ├── runner.py                   # Per-finding loop
+│   ├── discovery.py                # Report location + finding selection
+│   ├── select.py                   # Top-N by CVSS selection
+│   ├── models/                     # Remediation DTOs
+│   ├── playbook.py                 # Playbook engine
+│   └── policy/                     # Policy-gating
+├── validation/                      # S11 (Validation Agent)
+│   ├── cli/                        # CLI entry (validates/ subcommand)
+│   ├── execution/                  # Session launcher
+│   ├── session/                    # Session runner
+│   ├── subagents/                  # Three personas (security-architect, penetration-tester, cross-repo-analyzer)
+│   ├── tools/                      # Fact tools (DiffTouched, DiffImpactMap, PatternScan, TestInventory)
+│   ├── models/                     # Validation DTOs
+│   └── claude_config/              # Agent config YAML
+├── report/                          # Output generation
+│   ├── enrich.py                   # CVSS + CMDB + Markdown→SARIF
+│   ├── cvss.py                     # CVSS 3.1 scoring + env vectors
+│   ├── cwe.py                      # CWE taxonomy mapping
+│   └── redact.py                   # Secret/PII redaction at write time
+├── rules/                           # Taint knowledge base
+│   ├── sources.generated.yaml      # Source patterns (generated)
+│   ├── sinks.generated.yaml        # Sink patterns (generated)
+│   └── generic.kb.yaml             # Generic KB rules
+├── injectors/                       # Optional context loaders
+│   ├── cve_feed.py                 # Known CVE injection
+│   └── design_controls.py          # Design control injection (CMDB)
+├── util/                            # Utilities
+│   ├── environment.py              # setup/doctor checks
+│   ├── tokens.py                   # Token accounting (unified across backends)
+│   ├── prompts.py                  # Shared prompt blocks (EXCLUSION_RULES, SELF_VERIFICATION, etc.)
+│   ├── metrics.py                  # Scan metrics collection
+│   ├── errlog.py                   # Error logging (JSONL)
+│   ├── status.py                   # Progress spinner (`▶ [n/total] … / ✓ … (Ns)`)
+│   └── json_extract.py             # LLM response JSON parsing
+├── lang/                            # Language-specific hints
+│   ├── hints.py                    # EXT_TO_LANG, LANG_DISPLAY, SPECIALIST_HINTS
+│   └── (language plugins)          # Language-specific logic
+├── .env.example                     # Environment variable template
+├── pyproject.toml                   # Package metadata + dependencies
+├── README.md                        # Feature overview
+├── AGENTS.md                        # AI agent operating manual
+├── CLAUDE.md                        # Concise operating manual
+├── CONTRIBUTING.md                  # No external contributions currently
+└── LICENSE                          # Apache 2.0
+
+inputs/                              # Operator-editable context (not packaged)
+├── remediation_policy.yaml          # Policy gates for S10
+├── remediation_playbook.yaml        # Remediation templates
+└── validator_hints.yaml             # Per-CWE validation hints
+
+docs/                                # Documentation
+├── SETUP_GUIDE.md                  # Install + configuration
+├── USER_GUIDE.md                   # Commands + options
+├── models.md                       # Model/backend selection matrix
+├── architecture.md                 # Module layout
+├── remediation.md                  # S10 details
+├── validation.md                   # S11 details
+└── (other guides)
+
+tests/                               # Smoke tests
+scripts/                             # Developer helpers (not packaged)
+```
+
+---
+
+## 5. Agent Architecture
+
+### 5.1 Main Agent Loop / Control Flow
+
+**Single orchestrator, not a multi-agent system in the LLM sense:** The pipeline is driven by a serial stage orchestrator in [vvaharness/orchestrator/scan.py](vvaharness/orchestrator/scan.py#L1-L100), not a LangGraph graph or autonomous multi-agent loop.
+
+**Entry point:** [vvaharness/cli.py](vvaharness/cli.py#L1) → `main()` → argparse dispatcher:
+- `scan` (default) → [orchestrator/entry.py](vvaharness/orchestrator/entry.py#L1) → `scan_repo()` in [orchestrator/scan.py](vvaharness/orchestrator/scan.py#L1)
+- `remediate` → [cli.py:_remediate()](vvaharness/cli.py#L1) → [remediation_agent/remediate.py](vvaharness/remediation_agent/remediate.py)
+- `validate` → [cli.py:_validate()](vvaharness/cli.py#L1) → [validation/cli/__init__.py](vvaharness/validation/cli/__init__.py#L1)
+
+### 5.2 Pipeline Topology
+
+**Eleven-stage linear pipeline (S0–S11) with optional early termination:**
+```
+S0 (optional)  → Static seed from taint rules (AST callgraph)
+S1 (preprocess) → Repo inventory + AST mapping (agentic)
+   → S1a (autoexclude) → Structured filtering
+S2 (threatmodel) → STRIDE threat model (deterministic evidence + 1 LLM call)
+S3 (decompose) → Strategist: risk-ranked hunt plan (1 LLM call, no code)
+S4 (deepdive) → Deep analysis: find vulnerabilities (N runs with voting, code samples)
+S5 (prefilter) → Deterministic FP filtering (0 LLM calls, pure Python)
+S6 (verify) → Adversarial verifier: TRUE/FALSE_POSITIVE + CVSS (agentic, N instances in parallel)
+S7 (dedup) → Semantic dedup + grouping (1 LLM call)
+S8 (chain) → Chain synthesis + final severity (1 LLM call)
+S9 (report) → Markdown + SARIF 2.1.0 output (0 LLM calls, pure Python)
+[--stop-after s9 → stop here]
+S10 (remediate) → Remediation Agent: propose + apply fixes (per-finding LLM + tool calls)
+S11 (validate) → Validation panel: 3 personas score each DTO (per-DTO LLM + tool calls)
+```
+
+### 5.3 Agent Roles & Frameworks
+
+**S1–S9 (Detection):** Each stage invokes either `backends.llm.prompt()` (read-only completion) or `backends.llm.agentic()` (tool-using agent loop).
+
+- **S1 (preprocess), S1a (autoexclude):** Agentic; Claude CLI/SDK runs with Read/Glob/Grep/Bash; produces ContextPackage JSON.
+- **S2 (threatmodel), S3 (decompose), S4 (deepdive), S6 (verify), S7 (dedup), S8 (chain):** Prompt-only or agentic (S4, S6 use tools).
+- **S4 multi-run voting:** Runs N deep-dives at `temperature: T > 0` (S4 backend dispatcher calls `backends.sdk._supports_temperature()` to check model support and gate temperature). Votes via majority on canonical key (file, line_bucket, vuln_class). ([s4_deepdive.py](vvaharness/pipeline/stages/s4_deepdive.py#L1-L50))
+
+**S10 (Remediation Agent):** Hoisted into `backends/harness/` (DeepAgents/LangGraph abstraction). Per-finding agent invocation using Claude Agent SDK or delegated to DeepAgents. Reads scan findings, calls tools (Read/Edit/Write in fix mode, confined to repo root), writes DTOs under `<repo>/security-remediation/<NN_slug>/`. ([remediation_agent/remediate.py](vvaharness/remediation_agent/remediate.py#L1-L50))
+
+**S11 (Validation Agent):** Three subagents (security-architect, penetration-tester, cross-repo-analyzer) spawned dynamically via Claude Agent SDK or DeepAgents. Each persona returns a structured `PersonaReport`. Orchestrator aggregates scores. ([validation/subagents/_loader.py](vvaharness/validation/subagents/_loader.py#L1-L60))
+
+### 5.4 State Management
+
+**State object:** Each step receives and emits a pydantic BaseModel contract defined in [vvaharness/models.py](vvaharness/models.py#L1-L100):
+- S1 output: `ContextPackage` (no raw code, mapped AST + entry points + sinks + call graph)
+- S2 output: `ThreatModel` (assets, trust boundaries, STRIDE threats)
+- S3 output: `TaskManifest` (ranked chunks with hypotheses)
+- S4 output: `list[Finding]` (vulnerability candidates)
+- S7 output: tuple of deduplicated `(dropped, verified, dropped, canonical, dup_dropped)`
+- S8 output: `FinalReport` (Markdown + SARIF ready)
+
+**Persistence:** SQLite-backed checkpoints (NO pickle) in `$VVAHARNESS_STATE_DIR/vvaharness.db` ([orchestrator/checkpoints.py](vvaharness/orchestrator/checkpoints.py#L1-L80)):
+- `pydantic.TypeAdapter.dump_json()` serialization
+- `model_validate_json()` deserialization on load
+- Tampered payloads → `ValidationError` → step re-run (safe degradation)
+- Per-step schema defined in `_STEP_SCHEMA` dict
+
+**Key data model:** `ContextPackage` ([models.py](vvaharness/models.py#L500-L800)):
+- `repo_root: str`, `language: str`
+- `call_graph: dict[str, list[str]]` — caller_fqn → [callee_fqn]
+- `call_graph_files: dict[str, list[str]]` — fn → ["file:line", …]
+- `entry_points: list[EntryPoint]` — (file, function, kind, reachable_from_unauth)
+- `unsafe_sinks: list[Sink]` — (file, line, function)
+- `seed_taint_paths: list[list[str]]` — from S0 static seed
+- `seed_taint_evidence: list[TaintEvidencePath]` — detailed taint edges
+- `threat_model: ThreatModel | None` — attached after S2
+
+### 5.5 Message/History Representation
+
+**No conversation memory across stages.** Each stage:
+1. Loads prior checkpoint (pydantic model)
+2. Constructs a fresh LLM prompt with structured context blocks (never raw conversation history)
+3. Calls LLM once or N times (streaming for large responses)
+4. Parses JSON response into pydantic model
+5. Saves checkpoint
+6. Next stage loads the checkpoint
+
+**Prompt assembly:** Text blocks concatenated deterministically from context (ContextPackage.to_prompt_block(), ThreatModel.to_prompt_block(), etc.). No memory management needed; each stage is stateless.
+
+### 5.6 Graph / DAG / State Machine Usage
+
+**Tree-sitter callgraph DAG (S0/S1):** Deterministic interprocedural call graph built by [pipeline/callgraph_engine/](vvaharness/pipeline/callgraph_engine/) using tree-sitter AST + taint rules. Stored as `dict[str, list[str]]` in ContextPackage.
+
+**LangGraph for S11 (optional):** Validation agent can be launched via Claude Agent SDK or DeepAgents/LangGraph. The LangGraph nodes are defined in [validation/execution/pipeline.py](vvaharness/validation/execution/pipeline.py#L1-L50) and [validation/session/launcher.py](vvaharness/validation/session/) — launches a session with three persona nodes that process findings in parallel.
+
+**No explicit state machine DSL:** Control flow is imperative Python in [orchestrator/scan.py](vvaharness/orchestrator/scan.py), not declarative YAML/graph definition.
+
+---
+
+## 6. LLM Provider Abstraction
+
+**Three-backend dispatcher in [backends/llm.py](vvaharness/backends/llm.py):**
+
+```python
+def resolve(model_cfg: Any) -> tuple[str, str, dict]:
+    # Returns (model_id, backend, extras: {temperature, thinking_budget, betas})
+    # Accepts: bare string "claude-opus-4-7" → ("claude-opus-4-7", "cli", {})
+    #          or Config object with .id, .via, .temperature, etc.
+
+_BACKENDS = {"cli": cli, "sdk": sdk, "openai": oai}
+
+def prompt(user_prompt: str, *, model: Any, **kw) -> str:
+    model_id, via, extras = resolve(model)
+    backend = _BACKENDS.get(via)
+    return backend.prompt(user_prompt, model=model_id, **kw)
+
+def agentic(user_prompt: str, *, model: Any, **kw) -> str:
+    # Tool-using loop
+    return backend.agentic(user_prompt, model=model_id, **kw)
+```
+
+**Supported providers:**
+
+| Provider | Backend | Auth | Stage Usage | Capabilities |
+|---|---|---|---|---|
+| **Anthropic Claude** (all models) | `via: cli` | Claude Code OAuth token (`CLAUDE_CODE_OAUTH_TOKEN`) | S1–S9 | Read, Glob, Grep, Bash (only backend with Bash) |
+| **Anthropic Claude** (via SDK) | `via: sdk` | `ANTHROPIC_SDK_API_KEY` | S1–S9 | Read, Glob, Grep (no Bash); streaming; temperature control; prompt caching |
+| **OpenAI** (gpt-4o, o1, etc.) | `via: openai` | `OPENAI_API_KEY` | S1–S9 (S10/S11 unsupported; raises NotImplementedError on file-mutation tools) | Read, Glob, Grep (local tool loop); no Bash; rejects `temperature` on reasoning models |
+| **Anthropic/OpenAI** (via DeepAgents) | `via: deepagents` | `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` | S10 (remediate), S11 (validate) | Read/Edit/Write/Bash in mutating roles (cwd-confined); permission sandbox |
+
+**Model configuration in [config/profiles/default.yaml](vvaharness/config/profiles/default.yaml):**
+```yaml
+models:
+  autoexclude:  {id: claude-sonnet-4-6, via: cli}       # S1a
+  preprocess:   {id: claude-sonnet-4-6, via: cli}       # S1
+  threatmodel:  {id: claude-sonnet-4-6, via: cli}       # S2
+  decompose:    {id: claude-sonnet-4-6, via: cli}       # S3
+  deepdive:     {id: claude-sonnet-4-6, via: cli}       # S4
+  verify:       {id: claude-sonnet-4-6, via: cli}       # S6
+  dedup:        {id: claude-sonnet-4-6, via: cli}       # S7
+  chain:        {id: claude-sonnet-4-6, via: cli}       # S8
+  remediate:    {id: claude-opus-4-8, via: deepagents, provider: anthropic}   # S10
+  validate:
+    orchestrator: {id: claude-opus-5, via: deepagents, provider: anthropic}   # S11
+    security_architect: {id: claude-sonnet-4-6}         # S11 persona
+    penetration_tester: {id: claude-sonnet-4-6}         # S11 persona
+    cross_repo_analyzer: {id: claude-sonnet-4-6}        # S11 persona (conditional)
+```
+
+**Model routing example (S4 deepdive voting):**
+```python
+# backends/llm.py
+model_cfg = cfg.models.deepdive  # e.g., {id: "claude-opus-4-6", via: "sdk", temperature: 1.0}
+model_id, via, extras = resolve(model_cfg)
+# → ("claude-opus-4-6", "sdk", {"temperature": 1.0})
+backend = _BACKENDS["sdk"]
+result = backend.agentic(prompt, model="claude-opus-4-6", temperature=1.0, ...)
+```
+
+**Streaming:** SDK backend streams responses to avoid HTTP timeout on 64k-token responses. ([backends/sdk.py](vvaharness/backends/sdk.py#L100-L200))
+
+**Prompt caching:** SDK backend caches system prompts (S4 repeats the same system prompt across N×runs; ~10% cost savings). ([backends/sdk.py](vvaharness/backends/sdk.py#L150))
+
+**Temperature handling:** CLI backend ignores temperature (no --temperature flag); SDK drops it for models that reject it (OpenAI's o-series, reasoning models). ([backends/llm.py](vvaharness/backends/llm.py#L70-L100))
+
+---
+
+## 7. Tool System
+
+### 7.1 Tool Definition & Dispatch
+
+**S1–S9 backends:** Tools are NOT hand-defined; they come from the underlying LLM infrastructure:
+- **`via: cli`** → Tools are built into the `claude` CLI: Read, Glob, Grep, Bash (shell execution). No custom tool definitions.
+- **`via: sdk` / `via: openai`** → Agentic modes use a sandboxed local tool loop in [backends/localtools.py](vvaharness/backends/localtools.py#L1-L150), which wraps Read/Glob/Grep as standalone Python functions (no actual shell execution).
+
+**S10 (Remediation, `via: deepagents`):** Uses Claude Agent SDK tool system (native Edit/Write/Read/Glob/Grep/Bash). Tools are defined in the SDK's config and gated by a deny-by-default permission callback in [backends/agent_sdk.py](vvaharness/backends/agent_sdk.py#L1-L100).
+
+**S11 (Validation, `via: deepagents`):** Custom fact tools defined in [validation/tools/deep_tools.py](vvaharness/validation/tools/deep_tools.py#L1-L100):
+- Generic readers (from deepagents)
+- Custom fact tools: `DiffTouched`, `ChangedLines`, `DiffImpactMap`, `PatternScan`, `TestInventory`
+
+### 7.2 Built-in Tools
+
+**Read-only tools (all backends):**
+- **Read(file_path, offset, limit)** → file contents, line-truncated, redacted for secrets/PII
+- **Glob(pattern)** → file paths matching a pattern, confined to repo root
+- **Grep(pattern, paths)** → lines matching regex, with line numbers, redacted output
+
+**S1-specific (via:cli only, Bash):**
+- **Bash(command)** → shell execution for repo inventory, dependency resolution, build metadata. Only CLI backend supports this (SDK/OpenAI block Bash intentionally).
+
+**S10 remediation (via:deepagents, CLI agent SDK):**
+- **Edit(file, line, old_text, new_text)** → in-place diff application
+- **Write(file, content)** → file creation/overwrite
+- **MultiEdit, NotebookEdit** → bulk operations
+- Permission sandbox in [agent_sdk.py:_gate()](vvaharness/backends/agent_sdk.py#L50-L120): resolves paths, rejects symlinks, enforces cwd confinement (NO symlink redirection outside repo)
+
+**S11 validation (via:deepagents, fact tools):**
+```python
+# vvaharness/validation/tools/deep_tools.py
+
+@tool
+def DiffTouched(file_path: str) -> dict:
+    """Return whether *file_path* is in diff.patch and its changed line ranges."""
+
+@tool
+def ChangedLines(file_path: str) -> list[tuple[int, int]]:
+    """Return added line ranges for *file_path* from diff.patch."""
+
+@tool
+def DiffImpactMap() -> dict:
+    """Return files changed by diff.patch and whether a trust boundary was touched."""
+
+@tool
+def PatternScan(pattern_set: str) -> list[dict]:
+    """Run deterministic regex patterns (secret_exposure, insecure_value) over workspace."""
+
+@tool
+def TestInventory() -> dict:
+    """Inventory test files and detect negative/adversarial test markers."""
+```
+
+### 7.3 Tool Call Parsing & Dispatch
+
+**Claude CLI backend ([backends/claude_cli.py](vvaharness/backends/claude_cli.py)):**
+- Subprocess invocation: `claude -p --output-format json --tools ... --cwd <repo> --system <prompt> --user <user_prompt>`
+- Tool calls are made by Claude inside the subprocess; results are re-fed by the CLI.
+- JSON envelope parsing in `_parse_envelope()` extracts result text + usage.
+
+**SDK/OpenAI backend ([backends/sdk.py](vvaharness/backends/sdk.py), [backends/oai.py](vvaharness/backends/oai.py)):**
+- Hand-implemented tool loop: while stop_reason == "tool_use", call the local tool, re-inject result.
+- Local tools execute in Python (Read/Glob/Grep confined to cwd via `_jail(root, path)`).
+- Redaction applied before result re-enters model context.
+
+### 7.4 Sandboxing / Permission Model
+
+**S1–S9 read-only backends:**
+- Path confinement: `_jail(root, path)` normalizes paths, rejects `..`, symlinks pointing outside.
+- `_MAX_BYTES = 200_000` per Read response, `_MAX_GREP_LINE = 50_000` to prevent regex backtracking DoS.
+- Redaction applied before tool results re-enter model context: `redact_counts()` masks secrets/PII.
+
+**S10 remediation (via:deepagents):**
+- Claude Agent SDK permission callback ([agent_sdk.py:_gate()](vvaharness/backends/agent_sdk.py#L50-L100)):
+  - Read-only tools (Read/Glob/Grep) → always allowed
+  - File-mutation tools (Edit/Write) → allowed only if target path resolves within `cwd` (repo root)
+  - Symlink final component → rejected (prevents redirection outside repo)
+  - Bash → **explicitly DENIED** (no host shell; diffs applied via Edit/Write instead)
+- Approval flow: None (fix mode is autonomous, not interactive; approval exists for proposal mode)
+
+**S11 validation (read-only):**
+- No file mutations; fact tools operate on `diff.patch` and workspace snapshots.
+
+---
+
+## 8. Prompt / System Message Strategy
+
+### 8.1 System Prompts
+
+System prompts are **stage-specific** and **embedded as multi-line strings** in each stage file:
+
+| Stage | System Prompt | Key Focus |
+|---|---|---|
+| **S1 (preprocess)** | [s1_preprocess.py](vvaharness/pipeline/stages/s1_preprocess.py#L1-L100) | Repo inventory (modules, entry points, sinks, call graph) — agentic |
+| **S2 (threatmodel)** | [s2_threatmodel.py](vvaharness/pipeline/stages/s2_threatmodel.py#L1-L50) | STRIDE threat model builder (deterministic evidence collection, then one LLM call) |
+| **S3 (decompose)** | [s3_decompose.py](vvaharness/pipeline/stages/s3_decompose.py#L1-L100) | Strategist: risk-rank chunks, tie each to threat, account for controls |
+| **S4 (deepdive)** | [s4_deepdive.py](vvaharness/pipeline/stages/s4_deepdive.py#L1-L150) | QUALITY BAR (reachability, unmitigated, concrete, in-scope, cited); multi-run voting |
+| **S6 (verify)** | [s6_verify.py](vvaharness/pipeline/stages/s6_verify.py#L1-L150) | Adversarial verifier: PROVE THE FINDING WRONG; output TRUE/FALSE_POSITIVE + CVSS:3.1 |
+| **S7 (dedup)** | [s7_dedup.py](vvaharness/pipeline/stages/s7_dedup.py#L1-L100) | Semantic dedup: collapse root-cause duplicates |
+| **S8 (chain)** | [s8_chain.py](vvaharness/pipeline/stages/s8_chain.py#L1-L100) | Chain synthesis: multi-step exploits + final severity |
+
+### 8.2 Shared Prompt Blocks
+
+Reusable blocks in [vvaharness/util/prompts.py](vvaharness/util/prompts.py#L1-L100):
+
+```python
+EXCLUSION_RULES = """
+OUT OF SCOPE — do not report:
+A. NO REAL ATTACKER (tests, dev-only, local-only inputs)
+B. NO SECURITY IMPACT (crashes, design-as-intended)
+C. WRONG LAYER (client-side vs. server-side, managed languages)
+D. HANDLED ELSEWHERE (SCA/dependencies, volumetric DoS)
+E. NOISE FLOOR (log injection, LLM prompts, theoretical gaps)
+"""
+
+SELF_VERIFICATION = """
+GATE EVERY FINDING ON THESE FIVE CHECKS:
+1. REACHABLE
+2. UNMITIGATED
+3. CONCRETE
+4. IN SCOPE
+5. CITED
+"""
+
+SEVERITY_GUIDANCE = """..."""
+EXHAUSTIVENESS = """..."""
+```
+
+Injected into S4, S6, S7, S8 prompts via `${BLOCK}` or direct concatenation.
+
+### 8.3 Templating & Context Injection
+
+**Context blocks assembled deterministically:**
+```python
+# ContextPackage.to_prompt_block() in models.py
+def to_prompt_block(self, max_edges: int = 400) -> str:
+    lines = [
+        f"REPO: {self.repo_root}  LANG: {self.language}",
+        "",
+        f"MODULES ({len(self.modules)}):",
+        # ... module details
+        f"ALL FILES ({len(self.all_files)}):",
+        # ... entry points, sinks, call graph, ...
+    ]
+    return "\n".join(lines)
+```
+
+**No Jinja2 / mustache templating.** All prompts are hardcoded Python strings with `.format()` or f-strings.
+
+### 8.4 Prompt Caching
+
+**Anthropic SDK backend only** ([backends/sdk.py](vvaharness/backends/sdk.py#L150-L200)):
+```python
+# S4 deep-dive runs the same system_prompt N times; cache it.
+cache_control = {"type": "ephemeral"}  # Anthropic cache header
+response = client.messages.create(
+    model=model_id,
+    system=[
+        {"type": "text", "text": system_prompt},
+        {"type": "text", "text": "...", "cache_control": cache_control},
+    ],
+    messages=[{"role": "user", "content": user_prompt}],
+    ...
+)
+```
+Cache hits for S4 repeated runs: ~10% cost savings.
+
+### 8.5 Few-Shot Examples
+
+No explicit few-shot examples in system prompts. S6 verifier does have embedded examples of VERDICT format: `VERDICT: TRUE_POSITIVE (confidence: 9/10) — ...` ([s6_verify.py](vvaharness/pipeline/stages/s6_verify.py#L100-L150))
+
+---
+
+## 9. Memory & Context Management
+
+### 9.1 Short-Term (Working Memory)
+
+**Per-stage working state:** Loaded from SQLite checkpoint at stage start, emitted at stage end. No working memory persistence between stages.
+
+**Step state lifecycle:**
+```python
+# orchestrator/scan.py
+ckpt = load_ckpt(run_id, "s1")
+if ckpt:
+    ctx = ckpt  # Resume from checkpoint
+else:
+    ctx = s1_preprocess.run(repo_root, cfg)
+    save_ckpt(run_id, "s1", ctx)
+```
+
+**In-memory buffering:** Large responses (e.g., S4 outputs ~10k findings before S5 filter) stay in Python memory during that stage, no intermediate spilling to disk.
+
+### 9.2 Long-Term (Persistent State)
+
+**SQLite state store** ([orchestrator/store.py](vvaharness/orchestrator/store.py)):
+```sql
+CREATE TABLE runs (
+    run_id TEXT PRIMARY KEY,
+    repo_path TEXT,
+    created_at TIMESTAMP,
+    ...
+);
+
+CREATE TABLE checkpoints (
+    run_id TEXT,
+    step TEXT,
+    payload BLOB,  -- TypeAdapter.dump_json() bytes
+    created_at TIMESTAMP,
+    FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
+);
+
+CREATE TABLE callgraph (
+    run_id TEXT,
+    step TEXT,
+    graph_json TEXT,  -- Compressed call graph
+    ...
+);
+```
+
+**Checkpoint serialization:** Pydantic `TypeAdapter.dump_json()` → JSON bytes (no pickle), validated on load via `model_validate_json()`.
+
+**Vector DB:** None. VVAH does not use embeddings or semantic search. Static analysis (callgraph, taint edges) provides the structure.
+
+### 9.3 Truncation / Summarization
+
+**Per-stage prompt truncation (applied by ContextPackage views):**
+- `ast_context_view()` — limits files, entry points, sinks, edges, notes for frontier LLM context
+- `to_prompt_block()` — full inventory, up to default limits (250 files, 120 entry points, etc.)
+- `to_decompose_prompt_block()` — method-centric, avoids full file list for S3
+
+**Token counting:** Unified counter in [util/tokens.py](vvaharness/util/tokens.py):
+```python
+class TokenCounter:
+    input_tokens = 0
+    output_tokens = 0
+    @property
+    def total_tokens(self): return self.input_tokens + self.output_tokens
+
+TOKENS = TokenCounter()  # Global singleton
+```
+Every backend (CLI, SDK, OpenAI) updates this after each call.
+
+### 9.4 Context-Window Management
+
+**Explicit context budgets per stage:**
+- S4 deep-dive: up to 64k-token response budget (requested via `max_tokens=64000` in prompt call)
+- S3 strategist: compact prompt (~5k tokens) for strategy reasoning
+- S6 verifier: narrow prompt focused on one finding + call graph slice
+
+**No automatic context compression.** If a repo exceeds pipeline context budgets, earlier stages reduce scope via:
+- `--stop-after s3` → estimate costs before deep-dive
+- `estimate` command → scans once and prints scope preview (files, bytes, ~token count)
+- Manual `--step3-config` / `--step1-config` overlays for custom exclusion rules
+
+---
+
+## 10. Planning Subsystem
+
+### 10.1 Explicit Planner
+
+**S3 Decompose is the dedicated planning stage** ([s3_decompose.py](vvaharness/pipeline/stages/s3_decompose.py#L1-L100)):
+- Input: ContextPackage (no raw code, mapped structure only)
+- Model: Claude Sonnet 4.6 (default) via `prompt()` (read-only, no tools)
+- Output: TaskManifest (list of Chunks with risk ranking)
+
+**Strategist prompt drives planning:**
+```python
+SYSTEM = """You are a vulnerability research strategist.
+1. Rank attack surfaces by risk. Unauth-reachable entry points + unsafe sinks = highest.
+2. Hunt for VARIANTS of known CVEs.
+3. Account for design controls.
+4. Tie every chunk to a THREAT from the threat model.
+5. Chunk the work. Use the CALL GRAPH: put caller + callee in SAME chunk.
+6. For LARGE chunks, name entry-point functions to anchor a sliding window.
+
+Respond with ONLY a JSON object:
+{
+  "rationale": "...",
+  "chunks": [
+    {
+      "id": "chunk-01",
+      "size": "small|medium|large",
+      "risk_rank": 1,
+      "files": [...],
+      "focus_entry_points": [...],
+      "hypothesis": "...",
+      "threat_id": "T3",
+      "related_cves": [...]
+    }
+  ]
+}"""
+```
+
+### 10.2 Task Decomposition & Chunking
+
+**Output: TaskManifest.chunks** — each chunk is:
+```python
+class Chunk(BaseModel):
+    id: str                          # "chunk-01"
+    size: ChunkSize                  # "small" | "medium" | "large"
+    risk_rank: int                   # 1 = highest
+    files: list[str]                 # files to load for this chunk
+    focus_entry_points: list[str]    # function names (anchor sliding window on large)
+    hypothesis: str                  # strategist's reasoning
+    related_cves: list[str]          # variant-hunt seeds
+    threat_id: str | None            # link to threat model
+    specialist: str | None           # "crypto" | "logic-bug" | etc. (cross-cutting pass)
+    path_funcs: list[str]            # [on taint chunks] qnodes on BFS path entry→…→sink
+    source_ref: str                  # [on taint chunks] "file::function" entry point
+    sink_ref: str                    # [on taint chunks] "file:line" sink
+    sink_cwe: list[str]              # [on taint chunks] CWE tags from S0
+```
+
+**S4 deep-dive does NOT decompose tasks further.** It takes one chunk at a time and explores it exhaustively. No subtasking within S4.
+
+### 10.3 Todo Lists / Checkpoints
+
+**No explicit todo list** beyond the TaskManifest chunks and SQLite checkpoint tracking.
+
+**Resumption via `--resume` flag:**
+```bash
+vvaharness scan --repo <path> --resume
+# Skips already-completed steps (S1–S8 detected via checkpoint presence)
+# Useful for partial re-runs after timeout or error recovery
+```
+
+### 10.4 Subagent Spawning
+
+**Not a planning mechanism.** S11 validation spawns three personas:
+1. **security-architect** — How does the fix work? Is it correct?
+2. **penetration-tester** — Can I break the fix? What attack remains?
+3. **cross-repo-analyzer** — (conditional) Does the fix work across repos? Are there interdependencies?
+
+Subagent prompts defined in [validation/subagents/](vvaharness/validation/subagents/):
+- [security-architect.md](vvaharness/validation/subagents/security-architect.md)
+- [penetration-tester.md](vvaharness/validation/subagents/penetration-tester.md)
+- [cross-repo-analyzer.md](vvaharness/validation/subagents/cross-repo-analyzer.md)
+
+---
+
+## 11. Sub-agents / Delegation
+
+**Two scenarios:**
+
+### 11.1 S10 Remediation Agent
+
+**Single agent per finding** (not a sub-agent in the validation sense, but a separate agentic role):
+```python
+# remediation_agent/runner.py
+def remediate_one(finding: Finding, repo_path: Path, cfg, ...) -> RemediationVerdict:
+    """
+    Run the Remediation Agent on one finding.
+    - Propose a fix (proposal mode, read-only)
+    - Apply the fix if operator allows (fix mode, writes via Edit/Write)
+    """
+    # Agent prompt, tools, backend dispatch
+    result = backend.agentic(prompt, model=cfg.models.remediate, ...)
+    return RemediationVerdict(...)
+```
+
+Backend: DeepAgents/LangGraph or Claude Agent SDK (depending on `via:` in config).
+
+Tools available:
+- Read/Glob/Grep (read-only)
+- Edit/Write (fix mode only, cwd-confined)
+- Bash (fix mode only)
+
+### 11.2 S11 Validation Panel
+
+**Three subagents (personas) spawned for each DTO:**
+
+```python
+# validation/execution/pipeline.py
+async def execute_plan(plan: FixValidationPlan, config: Config, ...) -> list[ValidationResult]:
+    """Spawn a validation session with three personas."""
+    await launch_session(config, plan.manifest, workspace_dir, plan.output_dir)
+    # Inside launch_session (validation/session/launcher.py):
+    #   - Load three subagent definitions (security-architect, penetration-tester, cross-repo-analyzer)
+    #   - Pass DTO + workspace to each persona
+    #   - Each persona returns a PersonaReport(grade, rationale, score)
+    #   - Orchestrator aggregates: consensus score, final validation status
+    results = collect_and_enrich(workspace_dir, ...)
+    return results
+```
+
+**Framework:** Claude Agent SDK with subagent definitions (YAML frontmatter + Markdown prompt). Loaded via [validation/subagents/_loader.py](vvaharness/validation/subagents/_loader.py#L1-L100):
+```python
+def load_agents(names: Iterable[str] | None = None, ...) -> dict[str, SubagentDefinition]:
+    """Load subagent definitions from bundled .md files."""
+    # Parses frontmatter: name, description, model, allowedTools, deniedTools, skills
+    # Returns SubagentDefinition with response_model=PersonaReport
+```
+
+**Persona response model:**
+```python
+class PersonaReport(BaseModel):
+    name: str
+    grade: Literal["approved", "conditionally_approved", "needs_revision", "rejected"]
+    score: float  # 0.0–1.0
+    rationale: str
+    concerns: list[str] = []
+    recommendations: list[str] = []
+```
+
+---
+
+## 12. Human-in-the-Loop
+
+### 12.1 Approval Prompts
+
+**S10 (Remediation):**
+- Proposal mode → agent proposes fix, writes to `<repo>/security-remediation/<NN_slug>/remediate_report.json`
+- Fix mode → agent edits source files, operator must manually approve or `--confirm` flag auto-approves
+- **Interactive mode** ([remediation_agent/interactive.py](vvaharness/remediation_agent/interactive.py)): operator can select specific findings to remediate via TUI (arrow keys, Enter)
+
+**S11 (Validation):**
+- No approval step; personas vote asynchronously
+- Consensus logic: 2+ personas grade "approved" → DTO marked approved; otherwise → needs_review
+
+### 12.2 Interrupts
+
+**Cooperative cancellation in [backends/claude_cli.py](vvaharness/backends/claude_cli.py#L1-L50):**
+```python
+_ABORT = threading.Event()
+_LIVE: set[subprocess.Popen] = set()
+
+def abort() -> int:
+    """Set stop flag and kill every in-flight `claude` subprocess."""
+    _ABORT.set()
+    for p in _LIVE:
+        _kill_tree(p)
+    return len(_LIVE)
+
+# In worker threads (S4/S6 ThreadPoolExecutor):
+if aborted():
+    return  # Exit early
+if proc.poll() is None:
+    proc.kill()  # Hard stop
+```
+
+User presses Ctrl-C → KeyboardInterrupt in main thread → `abort()` called → flag set + subprocess killed → workers exit cleanly.
+
+### 12.3 Review UI
+
+**CLI-based progress:**
+- Spinner: `▶ [n/total] finding 042 / ✓ finding 041 (2.3s)`  ([util/status.py](vvaharness/util/status.py))
+- Batch runner: per-repo progress table
+
+**Interactive selection (S10 remediation):**
+```bash
+vvaharness remediate --repo <path> --interactive
+# Presents a TUI: arrow keys to select findings, Enter to confirm
+# Calls parse_selection() / render_rows() in remediation_agent/interactive.py
+```
+
+**Report output:**
+- Markdown report: `<repo>/security-scan/vvaharness_report_TIMESTAMP.md`
+- SARIF: `<repo>/security-scan/vvaharness_sarif_TIMESTAMP.json`
+- Remediation artifacts: `<repo>/security-remediation/<NN_slug>/remediate_report.json`
+- Validation manifest: `.../security-scan/validation/manifest.json`
+
+---
+
+## 13. Sandboxing / Safety
+
+### 13.1 File I/O Confinement
+
+**Path jailing in [backends/localtools.py](vvaharness/backends/localtools.py#L50-L100):**
+```python
+def _jail(root: Path, p: str) -> Path | None:
+    """Resolve *p* to a real path confined to *root*, or None if it escapes."""
+    try:
+        cand = (root / p).resolve() if not os.path.isabs(p) else Path(p).resolve()
+    except (OSError, ValueError):
+        return None
+    try:
+        cand.relative_to(root)  # Raises ValueError if cand is outside root
+    except ValueError:
+        return None
+    return cand
+```
+
+**S10 fix mode in [backends/agent_sdk.py](vvaharness/backends/agent_sdk.py#L50-L120):**
+- Permission callback `_gate()` rejects symlinks in final path component (prevents link redirection outside repo)
+- Resolves canonicalized path, checks containment
+- Even if a symlink is swapped after this check, OS-level symlink traversal is risk (partially mitigated by no-follow semantics)
+
+**Full mitigation:** Running remediation in an isolated filesystem namespace (pivot_root / chroot / nix flake sandbox) not implemented.
+
+### 13.2 Network Policies
+
+**No outbound network rules enforced.** If repo contains a malicious build script, it could exfiltrate data (though read tools are redaction-hooked).
+
+**Credential protection:**
+- No credentials written to logs
+- Tool results redacted at re-injection (redact_counts() masks secrets)
+- SQLite state stored outside target repo (SECURITY comment in [orchestrator/scan.py](vvaharness/orchestrator/scan.py#L1-L50))
+
+### 13.3 Secret Handling
+
+**Redaction layers ([report/redact.py](vvaharness/report/redact.py)):**
+1. **Tool result redaction:** Before tool output re-enters model context, secrets are masked
+2. **Report-time redaction:** Final Markdown/SARIF redacts detected secrets/PII
+3. **Log file redaction:** JSONL error logs redact sensitive paths/commands
+
+**Patterns redacted:**
+- AWS keys (AKIA...)
+- GitHub tokens (ghp_, gho_, ghu_)
+- Slack tokens (xoxb-, xoxp-, xoxr-)
+- Private keys (BEGIN PRIVATE KEY)
+- Passwords in code
+
+**Redaction example:**
+```python
+# backends/claude_cli.py
+result = _parse_envelope(stdout)  # Unredacted raw response
+result = redact(result)  # Mask secrets
+TOKENS.add_completion(len(result), ...)
+```
+
+---
+
+## 14. Observability
+
+### 14.1 Logging
+
+**Per-run error log:** [util/errlog.py](vvaharness/util/errlog.py)
+```python
+# VVAHARNESS_ERR_LOG_PATH or <repo>/security-scan/errors.jsonl
+# Each error: {"stage": "s4", "chunk_id": "...", "error": "...", "timestamp": "..."}
+```
+
+**Verbosity control:** `VVAHARNESS_DEBUG=1` sets logging.DEBUG on all loggers.
+
+**Progress output:** Stage completion with duration
+```
+▶ [1/11] s1_preprocess / … / ✓ s1_preprocess (3.2s)
+▶ [2/11] s2_threatmodel / … / ✓ s2_threatmodel (2.1s)
+…
+```
+
+### 14.2 Tracing
+
+**No distributed tracing (OpenTelemetry, Jaeger, etc.) integrated.** Only local JSONL logging.
+
+**LangSmith / LangFuse:** Not integrated (but LangChain structures would support it if added).
+
+**Token counting:** Unified counter in [util/tokens.py](vvaharness/util/tokens.py)
+```python
+TOKENS.input_tokens += ...
+TOKENS.completion_tokens += ...
+```
+Aggregated in ScanMetrics and emitted to run_manifest.json.
+
+### 14.3 Token Counting
+
+**Every backend updates TOKENS singleton after each call:**
+```python
+# backends/sdk.py
+usage = response.usage
+TOKENS.input_tokens += usage.input_tokens
+TOKENS.completion_tokens += usage.output_tokens
+```
+
+**Cost estimation (not automatic):** User can run `vvaharness estimate --repo <path>` → prints scope summary (files, bytes, ~tokens).
+
+### 14.4 Cost Tracking
+
+**Output in [vvaharness/models.py:ScanMetrics](vvaharness/models.py#L1300-L1350):**
+```python
+class ScanMetrics(BaseModel):
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    total_tokens: int | None = None
+    tokens_by_phase: dict[str, dict] | None = None  # Per-stage breakdown
+    # Rendered in Markdown report as "Tokens: 123k input, 456k completion"
+```
+
+**Cost model:** Not baked in. Operator supplies model pricing; multiply (total_tokens × price_per_1k_tokens).
+
+---
+
+## 15. Evaluation / Testing
+
+### 15.1 Eval Suites
+
+**No large-scale eval suite bundled.** 
+
+**Smoke tests in [tests/](tests/):** Basic regression tests for:
+- Config loading
+- Model resolution
+- Stage entry/exit (checkpoint round-trip)
+
+### 15.2 Benchmark Runners
+
+**`estimate` command** ([cli.py:_estimate()](vvaharness/cli.py#L60-L100)): Estimates scope without running analysis.
+```bash
+vvaharness estimate --repo <path>
+# Output: file count, byte count, ~token count (bytes / 4)
+```
+
+**`doctor` command** ([cli.py:_doctor()](vvaharness/cli.py#L30-L60)): Validates readiness.
+```bash
+vvaharness doctor --config <path>
+# Checks: Python version, agent credentials, backend connectivity
+```
+
+### 15.3 Unit Tests for Agent Behavior
+
+**Minimal testing.** Example: [test_inventory.py](vvaharness/validation/tools/test_inventory.py) — unit test for test-file inventory detection logic.
+
+**Test fixtures:** None shipped; operator must bring their own repos.
+
+---
+
+## 16. Configuration
+
+### 16.1 Environment Variables
+
+**Primary auth vars:**
+```
+CLAUDE_CODE_OAUTH_TOKEN          # Claude CLI (via: cli)
+ANTHROPIC_SDK_API_KEY            # Anthropic SDK (via: sdk)
+ANTHROPIC_BASE_URL               # (optional, for SDK + CLI via gateway)
+ANTHROPIC_SDK_BASE_URL           # (override base_url for SDK)
+ANTHROPIC_API_KEY                # Fallback for SDK (or used by DeepAgents)
+ANTHROPIC_AUTH_TOKEN             # Alternative auth for Claude CLI
+OPENAI_API_KEY                   # OpenAI backend (via: openai)
+OPENAI_BASE_URL                  # (optional, for OpenAI via gateway)
+
+VVAHARNESS_STATE_DIR             # SQLite checkpoint location (default: ~/.vvaharness)
+VVAHARNESS_DEBUG                 # Set to 1 for verbose logging
+VVAHARNESS_ERR_LOG_PATH          # Override error log path
+VVAHARNESS_CMDB_PATH             # Path to app profile CMDB (JSON/CSV)
+```
+
+### 16.2 YAML Config Files
+
+**Config profiles in [config/profiles/](vvaharness/config/profiles/):**
+- **default.yaml** (S1–S9 via:cli, S10/S11 via:deepagents) — recommended for most users
+- **sdk.yaml** (all roles via:sdk, S4 voting on, no Bash)
+- **full.yaml** (multi-backend mixing)
+- **taint.yaml** (taint-first, S0-enabled, S10/S11 disabled)
+
+**Example config block:**
+```yaml
+models:
+  autoexclude:  {id: claude-sonnet-4-6, via: cli}
+  deepdive:     {id: claude-opus-4-6, via: sdk, temperature: 1.0}
+  verify:       {id: claude-sonnet-4-6, via: cli}
+  remediate:    {id: claude-opus-4-8, via: deepagents, provider: anthropic}
+  validate:
+    orchestrator: {id: claude-opus-5, via: deepagents, provider: anthropic}
+
+step1:
+  exclude_dirs: [custom_exclude_dir]
+  exclude_exts: [.custom_ext]
+
+step5_prefilter:
+  min_pre_confidence: 0.6
+  require_evidence: true
+
+step7_dedup:
+  line_tolerance: 10
+  pre_verify_threshold: 3
+
+step_remediate:
+  enabled: true
+  top_n_findings: 10
+
+step_validate:
+  enabled: true
+  max_findings: 20
+```
+
+**Config loading with env expansion ([config/__init__.py](vvaharness/config/__init__.py)):**
+```python
+# Supports ${VAR} and ${VAR:-default} syntax
+# Example: api_key: ${ANTHROPIC_API_KEY:-fallback_key}
+```
+
+**Local override:** Create `config.local.yaml` in the current directory or via `--config` flag.
+
+### 16.3 CLI Flags
+
+**Primary flags:**
+```bash
+vvaharness scan --repo <path> \
+  --config <profile.yaml> \
+  --repo-name <name> \
+  --application-id <id> \
+  --stop-after s9 \
+  --resume \
+  --remediate \
+  --top 10 \
+  --auto-step1 \
+  --no-auto-step1
+```
+
+**All flags defined in [orchestrator/entry.py](vvaharness/orchestrator/entry.py#L100-L200)** with argparse.
+
+---
+
+## 17. Entry Points
+
+### 17.1 CLI Commands
+
+**Primary entry:** `vvaharness` command ([vvaharness/cli.py](vvaharness/cli.py#L1))
+
+**Subcommands:**
+```bash
+vvaharness scan [args]             # Default; analyze repo (S0–S11)
+vvaharness remediate --repo <path> # S10 standalone: propose/apply fixes
+vvaharness validate --repo <path>  # S11 standalone: validate DTOs
+vvaharness setup                   # Preflight check + credential setup
+vvaharness doctor [--config CFG]   # Readiness probe (static + live)
+vvaharness estimate --repo <path>  # Scope preview (files, tokens, no spend)
+vvaharness gc [--keep-runs N] [--max-age-days D]  # Garbage collect old runs
+```
+
+### 17.2 Programmatic SDK
+
+**No official Python SDK.** Orchestrator is internal; users invoke via CLI.
+
+**Intended for future:** `import vvaharness; remediate(repo, cfg)` etc., but not currently stable/public.
+
+### 17.3 HTTP API
+
+**No HTTP API.** CLI is the only interface.
+
+---
+
+## 18. Notable Idioms / Patterns
+
+### 18.1 Type-Safe Data Flow
+
+Every stage input/output is a pydantic BaseModel, validated on checkpoint load. This prevents silent data corruption and makes debugging explicit (field path reported on ValidationError).
+
+### 18.2 Crash-Proof LLM Output Coercion
+
+[models.py](vvaharness/models.py#L40-L120) defines crash-proof coercers:
+```python
+def _coerce_confidence(v, default: float = 0.5) -> float:
+    """Map off-schema LLM values (e.g., "high", 95, NaN) to [0.0, 1.0]."""
+    # Instead of crashing on a bad value, map to safe default
+    # Finding survives with neutral confidence instead of vanishing
+```
+
+Applied to every strict field (Enum, int, float ranges) via `@field_validator(mode="before")`. No finding is silently dropped due to malformed LLM JSON.
+
+### 18.3 Redaction-Hooked Tool Results
+
+Every tool output that re-enters the model is redacted in-place:
+```python
+result = read(root, path)  # Raw file content
+result = redact_counts(result)  # Mask secrets/PII
+# Model sees redacted version; real data never egressed
+```
+
+### 18.4 Deterministic Repo Walk
+
+[s1_preprocess.py:_exclusion_sets()](vvaharness/pipeline/stages/s1_preprocess.py#L1-L80) provides a deterministic file walk (Exclusion dirs/exts/globs baked in + config overrides) so S3/S4 always cover the same surface regardless of what S1's agentic exploration found.
+
+### 18.5 Graph Context Slicing
+
+Multi-method graph slicing to reduce context:
+- `ast_context_view()` — trimmed view for frontier LLM
+- `to_decompose_prompt_block()` — method-centric, no full file list
+- `_call_graph_block()` — hot edges first (entry→sink), then cold
+
+### 18.6 Threat Model as Planning Anchor
+
+S2 threat model isn't just defensive architecture; it's actively used for planning:
+- S3 strategist must tie every chunk to a threat (coverage metric)
+- S6 verifier uses threat context to down-rank findings outside threat actors
+- S8 chain scorer uses threat + impact/likelihood to rank severity
+
+---
+
+## 19. Data Flow Diagram (Textual)
+
+### User Request End-to-End: Scan
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│ 1. USER INVOKES                                                         │
+│    $ vvaharness scan --repo /path/to/code --config default.yaml        │
+└─────────────────────────────────────────────────────────────────────────┘
+                                  ↓
+┌─────────────────────────────────────────────────────────────────────────┐
+│ 2. ORCHESTRATOR (orchestrator/entry.py + scan.py)                       │
+│    - Load config (env expansion via config/__init__.py)                │
+│    - Probe backends (preflight.py: credentials, connectivity)           │
+│    - Generate run_id from repo path (deterministic)                    │
+│    - Create run record in SQLite                                        │
+└─────────────────────────────────────────────────────────────────────────┘
+                                  ↓
+┌─────────────────────────────────────────────────────────────────────────┐
+│ 3. STAGE S0 (optional, if taint.yaml profile)                           │
+│    Tree-sitter static seed → SeedPackage (JSON checkpoint)              │
+└─────────────────────────────────────────────────────────────────────────┘
+                                  ↓
+┌─────────────────────────────────────────────────────────────────────────┐
+│ 4. STAGE S1 (s1_preprocess.py)                                          │
+│    Input: repo path                                                      │
+│    Agentic: Claude CLI reads repo with Bash tool                        │
+│    Output: ContextPackage (call graph, entry points, sinks, modules)   │
+│    Checkpoint: <db>/checkpoints s1 blob                                 │
+└─────────────────────────────────────────────────────────────────────────┘
+                                  ↓
+┌─────────────────────────────────────────────────────────────────────────┐
+│ 5. STAGE S1a (s1_autoexclude.py, if --auto-step1)                       │
+│    Input: ContextPackage                                                │
+│    Agentic: Structured filtering by file patterns                       │
+│    Output: ContextPackage (reduced all_files / entry_points)            │
+└─────────────────────────────────────────────────────────────────────────┘
+                                  ↓
+┌─────────────────────────────────────────────────────────────────────────┐
+│ 6. STAGE S2 (s2_threatmodel.py)                                         │
+│    Input: ContextPackage                                                │
+│    Deterministic: Gather README, manifests, config, docs (no LLM)       │
+│    Agentic: One prompt call → LLM emits ThreatModel JSON                │
+│    Output: ThreatModel (assets, trust boundaries, threats STRIDE)       │
+│    Attach to: ContextPackage.threat_model                               │
+└─────────────────────────────────────────────────────────────────────────┘
+                                  ↓
+┌─────────────────────────────────────────────────────────────────────────┐
+│ 7. STAGE S3 (s3_decompose.py)                                           │
+│    Input: ContextPackage + ThreatModel                                  │
+│    Model: Strategist (Claude Sonnet 4.6, via:cli)                       │
+│    Prompt: Structured context (NO raw code), threat model               │
+│    Output: TaskManifest (chunks with risk ranks, hypotheses)            │
+│    Chunks sorted: risk_rank 1..N                                        │
+└─────────────────────────────────────────────────────────────────────────┘
+                                  ↓
+┌─────────────────────────────────────────────────────────────────────────┐
+│ 8. STAGE S4 (s4_deepdive.py) — Per-chunk loop                           │
+│    For each chunk in manifest.sorted_chunks():                          │
+│      Input: Chunk + ContextPackage (code samples loaded)                │
+│      Deep-dive: N runs at temperature T on Claude Opus 4.6              │
+│        - Run 1: Call LLM → Finding[] (raw candidates)                  │
+│        - Run 2..N: Same prompt, different temp → Finding[] (votes)      │
+│      Intersection: Canonical key (file, line_bucket, vuln_class)        │
+│        - Keep if ≥ vote_threshold runs agree (default: 1 run/no vote)   │
+│      Output per chunk: Finding[] (deduplicated, aggregated findings)    │
+│                                                                          │
+│    Concatenate: All Finding[] from all chunks → S4_findings             │
+│    Checkpoint: findings list + outcomes dict                            │
+└─────────────────────────────────────────────────────────────────────────┘
+                                  ↓
+┌─────────────────────────────────────────────────────────────────────────┐
+│ 9. STAGE S5 (s5_prefilter.py) — Deterministic filtering (NO LLM)        │
+│    Input: S4_findings                                                   │
+│    Filters: test paths, hallucinated files, low confidence, missing     │
+│             evidence (if gated), trivial dups, semantic dups (1 LLM)    │
+│    Output: Reduced Finding[] (survivors)                                │
+│    Dropped: DroppedFinding[] (audit trail, reason=EXCLUDED, etc.)      │
+└─────────────────────────────────────────────────────────────────────────┘
+                                  ↓
+┌─────────────────────────────────────────────────────────────────────────┐
+│ 10. STAGE S6 (s6_verify.py) — Adversarial verification (Agentic)        │
+│     Input: S5_findings (likely true positives)                          │
+│     For each finding: Spawn worker thread, run verifier (Claude CLI)    │
+│       - Agentic: Read/Grep/Glob tools over repo                         │
+│       - Prompt: "PROVE THIS WRONG" + call graph context                 │
+│       - Output: verdict (TRUE/FALSE_POSITIVE) + CVSS:3.1 vector         │
+│     Parallel execution: ThreadPoolExecutor(max_workers=8)               │
+│     Reduce by half: Filter to TRUE_POSITIVE findings                    │
+│     Output: Finding[] (annotated with verdict + CVSS)                   │
+└─────────────────────────────────────────────────────────────────────────┘
+                                  ↓
+┌─────────────────────────────────────────────────────────────────────────┐
+│ 11. STAGE S7 (s7_dedup.py) — Deduplication                              │
+│     Input: Verified findings                                            │
+│     Grouping: Same file + vuln_class within line_tolerance → group     │
+│     Semantic dedup: One LLM call to collapse root-cause dups            │
+│     Output: (pre_dropped, verified, dropped, canonical, dup_dropped)   │
+│     Canonical: Finding[] (with .duplicates[] call sites)                │
+└─────────────────────────────────────────────────────────────────────────┘
+                                  ↓
+┌─────────────────────────────────────────────────────────────────────────┐
+│ 12. STAGE S8 (s8_chain.py) — Chain synthesis & severity                 │
+│     Input: Canonical findings                                           │
+│     Agentic: One LLM call                                               │
+│       - Identify multi-step exploits (chains)                           │
+│       - Final severity scoring (impact + likelihood + controls)         │
+│     Output: FinalReport (findings + chains + metrics)                   │
+└─────────────────────────────────────────────────────────────────────────┘
+                                  ↓
+┌─────────────────────────────────────────────────────────────────────────┐
+│ 13. STAGE S9 (report generation) — Deterministic (NO LLM)               │
+│     Input: FinalReport                                                  │
+│     Enrich: CVSS env scoring, CMDB app profile, CWE taxonomy            │
+│     Output: Markdown report + SARIF 2.1.0                               │
+│     Write to: <repo>/security-scan/                                     │
+│       - vvaharness_report_TIMESTAMP.md                                  │
+│       - vvaharness_sarif_TIMESTAMP.json                                 │
+│       - run_manifest.json (version, timing, tokens, args)               │
+│       - errors.jsonl (per-stage errors)                                 │
+└─────────────────────────────────────────────────────────────────────────┘
+                                  ↓ [--stop-after s9 → EXIT HERE]
+┌─────────────────────────────────────────────────────────────────────────┐
+│ 14. STAGE S10 (remediation_agent/remediate.py) — if enabled             │
+│     Input: Scan report (findings from <repo>/security-scan/)            │
+│     For each finding (up to top_n):                                      │
+│       - Remediation Agent (Claude Opus 4.8, via:deepagents)             │
+│       - Proposal mode: suggest a fix (read-only)                        │
+│       - Fix mode: apply the fix via Edit/Write (operator confirms)      │
+│       - Checkpoint: per-finding remediate_<idx> blob                    │
+│     Output: <repo>/security-remediation/<NN_slug>/                      │
+│       - remediate_report.json (verdict, diff, edit history)             │
+│       - evidence/triage.json, summary.md, diff.patch                    │
+└─────────────────────────────────────────────────────────────────────────┘
+                                  ↓
+┌─────────────────────────────────────────────────────────────────────────┐
+│ 15. STAGE S11 (validation/) — if enabled                                │
+│     Input: Fix DTOs from S10 (or prior scan's remediation/)              │
+│     For each DTO:                                                       │
+│       - Validation panel: 3 personas (security-architect,               │
+│         penetration-tester, cross-repo-analyzer)                        │
+│       - Each persona: agentic, reads diff + workspace                   │
+│       - Output: PersonaReport (grade: approved/conditional/needs_revision)
+│     Consensus: 2+ approved → DTO approved; else → needs_review          │
+│     Output: <repo>/security-scan/validation/                            │
+│       - manifest.json, persona_reports.jsonl                            │
+└─────────────────────────────────────────────────────────────────────────┘
+                                  ↓
+┌─────────────────────────────────────────────────────────────────────────┐
+│ 16. COMPLETION                                                          │
+│    Update run_manifest.json: end_ts, outcome, token counts              │
+│    Print summary:                                                        │
+│      ✓ Scan complete. 42 findings (38 TP, 4 FP).                        │
+│      📊 Report: <repo>/security-scan/vvaharness_report_2026-08-23.md    │
+│      🔧 Remediation: <repo>/security-remediation/ (10 fixed)            │
+│      ✅ Validation: 8 approved, 2 conditional, 0 failed                 │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 20. Weaknesses / Gaps
+
+### 20.1 Known Limitations
+
+**From [README.md](README.md#L1-L100):**
+> Findings and fixes are LLM-generated triage candidates that require human review — see [Limitations](#limitations-read-before-you-trust-output).
+
+Specific limitations documented include:
+- LLM hallucinations (off-by-one line numbers, misread code paths)
+- Context truncation (large repos may exceed prompt windows)
+- False negatives (some bugs not found; no guarantee of coverage)
+- Model drift (output changes between model versions)
+
+### 20.2 Missing Features
+
+1. **Distributed execution:** No support for running S4/S6 across multiple machines. ThreadPoolExecutor is single-box only.
+
+2. **Custom taint rules:** S0 taint seed requires operator-supplied `sources.generated.yaml` + `sinks.generated.yaml`. No bundled rule pack for common frameworks (Spring, Django, ASP.NET).
+
+3. **LLM fine-tuning:** No support for custom models or in-context learning (few-shot) built in; all roles routed to general-purpose models.
+
+4. **Caching across runs:** Callgraph and threat model are re-computed every scan. No persistent cache to speed up rescans of the same repo.
+
+5. **IDE/notebook integration:** CLI-only. No VS Code extension, JetBrains plugin, or Jupyter support.
+
+6. **Multi-repo analysis:** Each repo is scanned independently. No cross-repo taint tracking or shared artifact deduplication.
+
+7. **Interactive triage UI:** Remediation and validation are mostly non-interactive. Operator must manually select findings via CLI flags, not a full TUI/web dashboard.
+
+8. **Rollback / atomic fixes:** Fix mode edits files in-place; no rollback if a later stage fails. No transaction semantics.
+
+### 20.3 Hardcoded Values
+
+**Example hardcodes in [s1_preprocess.py](vvaharness/pipeline/stages/s1_preprocess.py#L60-L80):**
+```python
+_DEFAULT_EXCLUDE_DIRS = {
+    ".git", ".hg", ".svn", "node_modules", "__pycache__", 
+    ".venv", "venv", "dist", "build", ".idea", ".vscode", 
+    "target", "vendor", ".terraform", ".next", ".nuxt", 
+    "coverage", ".pytest_cache", ".mypy_cache", "test", "tests", ...
+}
+_DEFAULT_EXCLUDE_EXTS = {
+    ".png", ".jpg", ".jpeg", ".gif", ".ico", ".svg", ".pdf", 
+    ".zip", ".gz", ".tar", ".7z", ".jar", ".war", ".class", ...
+}
+```
+These can be overridden via config, but defaults are baked in.
+
+**Other hardcodes:**
+- Token limits (`_MAX_BYTES = 200_000` in localtools.py)
+- Thread pool size (8 workers in S4/S6)
+- Voting threshold (1 run = no vote, N runs require ≥ ceil(N/2)+1 agreement)
+- CVSS 3.1 field definitions (immutable)
+
+### 20.4 Performance Bottlenecks
+
+1. **S4 deep-dive is serialized per chunk.** If a large repo has 100 chunks, S4 runs 100 times serially (no chunk parallelization). Expected mitigation: S3 should produce smaller chunks or specialist passes should run in parallel.
+
+2. **S6 verification parallelized but limited.** ThreadPoolExecutor(max_workers=8) means at most 8 in-flight verifier LLM calls. For 1000 findings, still takes ~2 hours.
+
+3. **Callgraph construction.** Tree-sitter static analysis is multi-threaded internally but can be slow on large repos (>1M LOC).
+
+4. **Token accounting overhead.** Every tool call increments a global counter; no batching.
+
+### 20.5 Security / Compliance Gaps
+
+1. **No audit logging** of who ran what scan when (only local run_manifest.json, no tamper-proof log).
+
+2. **No approval workflow** for critical fixes (S10 fix mode edits files if --confirm is passed, no intermediate review gate).
+
+3. **No integration with existing SAST vendors** (no export to DefectDojo, Snyk, Checkmarx, etc.; only raw Markdown + SARIF).
+
+4. **Limited secret scanning.** Redaction is best-effort regex-based; determined attacker could craft strings that bypass the regex.
+
+### 20.6 Data Retention
+
+1. **No automatic cleanup.** SQLite checkpoints accumulate in `$VVAHARNESS_STATE_DIR/vvaharness.db` indefinitely. User must run `vvaharness gc --max-age-days 5` manually.
+
+2. **Scan artifacts never encrypted.** Reports and SARIF written to `<repo>/security-scan/` in plaintext. If repo is public, findings are public.
+
+### 20.7 Language Coverage
+
+**Supported for detection (S1–S9):**
+- Python, Java, C#, JavaScript/TypeScript, Go, C/C++, Ruby, PHP, Kotlin, Scala, Rust, SQL, YAML/JSON (IaC)
+
+**Taint-aware (S0 static seed, data-flow precise):**
+- Python, Java, C#
+
+**Weaker coverage:**
+- Scala, Kotlin, Ruby, PHP (call graph only, no interprocedural taint)
+- YAML/JSON (no taint, only pattern matching)
+
+---
+
+## Conclusion
+
+VVAH is a sophisticated, multi-stage AI-driven SAST platform that trades iterative improvement (multi-run voting, adversarial verification) for cost efficiency (deterministic filtering, no redundant re-runs). Its core design is **deterministic stage orchestration** (not graph-based or async), with **pydantic-backed data contracts** ensuring type safety and crash-free degradation. 
+
+Key differentiators:
+1. **Threat-model-driven planning** (S2→S3) focuses analysis on real attack surfaces
+2. **Multi-agent verification** (S6 + S11) reduces false positives and adds remediation validation
+3. **Structured triage** (SARIF + Markdown + DTOs) compresses Mean Time to Adapt
+4. **Vendor-agnostic backend routing** allows swapping LLM providers per stage
+5. **Permission sandboxing** in remediation (agent_sdk.py) prevents RCE on mutating roles
+
+Limitations: no distributed execution, no persistent caching, no custom taint rules bundled, no cross-repo analysis. Intended for **organizations that own the target code and run scans internally**, not as a managed SaaS.

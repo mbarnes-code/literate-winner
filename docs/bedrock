@@ -1,0 +1,905 @@
+Based on my thorough read-only analysis of the bedrock-engineer repository, here's a comprehensive architectural breakdown organized by your 20 requested dimensions:
+
+---
+
+## **1. Project Identity & Purpose**
+
+**Bedrock Engineer** is an autonomous software development agent desktop application built on Amazon Bedrock. From [README.md](reference/bedrock-engineer/README.md#L1-L10):
+
+> "Autonomous software development agent apps using Amazon Bedrock, capable of customize to create/edit files, execute commands, search the web, use knowledge base, use multi-agents, generative images and more."
+
+- **Type**: Native Electron desktop app (macOS optimized, cross-platform)
+- **Problem domain**: Code generation, file manipulation, web interaction, multi-agent orchestration
+- **Distribution**: Pre-built installers for macOS and Windows
+- **Latest version**: 1.22.0
+
+---
+
+## **2. Languages & Runtime**
+
+| Aspect | Details |
+|--------|---------|
+| **Primary languages** | TypeScript, React, Rust (CLI tools) |
+| **Runtime** | Electron 41.x, Node.js ≥20.19.0 |
+| **Build system** | electron-vite (Vite-based build) |
+| **Package manager** | npm/pnpm |
+| **Build tools** | electron-builder for packaging |
+
+Key [package.json](reference/bedrock-engineer/package.json#L1-L10) specs:
+- Electron 41.0.0, Vite 6.4.1, TypeScript 5.5.2, React 18.3.1
+- Multi-platform support with platform-specific build scripts (`build:mac`, `build:win`, `build:linux`)
+
+---
+
+## **3. Dependencies**
+
+### **Core AWS/Bedrock SDKs** ([package.json](reference/bedrock-engineer/package.json#L18-L28)):
+- `@aws-sdk/client-bedrock` (v3.995.0)
+- `@aws-sdk/client-bedrock-agent-runtime` (v3.995.0)
+- `@aws-sdk/client-bedrock-runtime` (v3.995.0)
+- `@aws-sdk/client-s3`, `@aws-sdk/client-sts`, `@aws-sdk/client-translate`
+- `@aws-sdk/credential-providers`
+
+### **Model Context Protocol (MCP)**:
+- `@modelcontextprotocol/sdk` (v1.26.0) — Full MCP support for extending tools
+
+### **UI & Visualization Libraries**:
+- React 18.3.1, React Router 6.30.3
+- TailwindCSS 3.4.10, Flowbite React
+- React Markdown 9.0.1, Rehype KaTeX, Remark Math (math & markdown)
+- Monaco Editor 4.6.0 (code editing)
+- Mermaid 11.4.0 (diagram generation)
+- draw.io via `react-drawio` (diagram editor)
+- Framer Motion 11.3.29 (animations)
+- Toast notifications (`react-hot-toast` 2.4.1)
+
+### **Tool & Infrastructure**:
+- Express 4.22.1 (HTTP server for IPC)
+- Socket.io 4.8.1 (bidirectional messaging)
+- Winston 3.17.0 + winston-daily-rotate-file (logging)
+- Zod 3.24.2 (runtime schema validation)
+- axios 1.13.5 (HTTP client)
+- Chart.js, react-chartjs-2 (metrics/analytics)
+- pdf-parse 1.1.1, mammoth 1.11.0 (document parsing)
+
+---
+
+## **4. Top-Level Directory Layout**
+
+From [src/](reference/bedrock-engineer/src/) directory structure:
+
+| Directory | Purpose |
+|-----------|---------|
+| **src/main/** | Electron main process (Node.js backend) |
+| **src/renderer/** | React frontend application |
+| **src/preload/** | Preload scripts (IPC bridge) |
+| **src/common/** | Shared types, utilities, validation, logging |
+| **src/types/** | TypeScript type definitions for agent architecture |
+| **.bedrock-engineer/** | User config, agent templates, project rules |
+| **build/** | Build outputs, icons |
+| **docs/** | Documentation |
+
+### **src/main/** ([list results](reference/bedrock-engineer/src/main)):
+```
+api/           → Bedrock service layer (agent, converse, flow, sonic)
+handlers/      → IPC event handlers (agent, background-agent, mcp, tools)
+services/      → Business logic (Strands Agents converter, background scheduling)
+lib/           → Utilities (IPC handler registry, proxy utils)
+mcp/           → MCP client integration
+store/         → Chat session persistence (chatSession.ts, todoSession.ts)
+```
+
+### **src/renderer/** ([list results](reference/bedrock-engineer/src/renderer)):
+```
+src/
+  pages/       → ChatPage, SettingPage, AgentDirectoryPage, etc.
+  components/  → Reusable React components
+  contexts/    → React Context API state (SettingsContext, ChatHistoryContext)
+  hooks/       → Custom hooks
+  lib/         → API clients
+  services/    → Toast, analytics
+  constants/   → Default agents, tool sets
+  i18n/        → Internationalization (English, Japanese)
+```
+
+### **src/preload/** ([structure inferred](reference/bedrock-engineer/src/preload)):
+```
+tools/         → Tool handler implementations (filesystem, bedrock, web, system, mcp)
+  handlers/
+    bedrock/   → InvokeBedrockAgent, InvokeFlow, GenerateImage, etc.
+    filesystem → ReadFiles, WriteToFile, ListFiles, etc.
+    web/       → FetchWebsite, TavilySearch
+    command/   → ExecuteCommand
+    system/    → ScreenCapture, CameraCapture
+    mcp/       → McpToolAdapter
+  registry.ts  → Tool registration and dispatch
+  base/        → BaseTool class, error handling
+```
+
+---
+
+## **5. Agent Architecture**
+
+### **Agent Invocation Model**
+
+**Dual-path architecture**:
+
+1. **Direct Agent Path** ([agentService.ts](reference/bedrock-engineer/src/main/api/bedrock/services/agentService.ts#L60-L100)):
+   - Uses AWS Bedrock `InvokeAgentCommand`
+   - Stateful sessions (sessionId reused across turns)
+   - Supports trace logging (`enableTrace`)
+   - Returns streaming completion with traces
+
+2. **Converse (Multi-turn LLM) Path** ([converseService.ts](reference/bedrock-engineer/src/main/api/bedrock/services/converseService.ts#L25-L75)):
+   - Uses `ConverseCommand` / `ConverseStreamCommand` (streaming)
+   - Tool-use enabled (Bedrock tool definitions)
+   - Message-based history
+   - Supports inference profiles & thinking mode
+
+3. **Background Agent Path** ([BackgroundAgentService.ts](reference/bedrock-engineer/src/main/api/bedrock/services/backgroundAgent/BackgroundAgentService.ts#L1-L50)):
+   - Scheduled/autonomous execution
+   - Persistent session management
+   - Tool execution with result capture
+   - Progress callbacks via pub-sub
+
+### **Pattern: Single-Agent Multi-Tool (Plan-and-Solve + ReAct)**
+
+From [toolRuleGenerator.ts](reference/bedrock-engineer/src/common/agents/toolRuleGenerator.ts#L1-L50):
+- **PLAN MODE**: Read-only tools (gather context, research)
+- **ACT MODE**: Full tool access (execute changes)
+- Dual modes switch per user request
+- System prompt enforces mode-specific tool constraints
+
+### **Message/History Representation** ([ChatSessionManager](reference/bedrock-engineer/src/main/store/chatSession.ts#L1-L80)):
+
+```typescript
+interface ChatSession {
+  id: string
+  title: string
+  createdAt: number
+  updatedAt: number
+  messages: ChatMessage[]        // Full message history
+  agentId: string
+  modelId: string
+  systemPrompt?: string
+}
+
+interface ChatMessage {
+  role: 'user' | 'assistant'
+  content: string | ContentBlock[]  // Mixed text + tool results
+  timestamp?: number
+  metadata?: { toolName?: string; executionTime?: number }
+}
+```
+
+Messages stored as JSON files on disk per session.
+
+### **State Management** ([SettingsContext.tsx](reference/bedrock-engineer/src/renderer/src/contexts/SettingsContext.tsx#L48-L180)):
+
+**React Context API** (not Redux/Zustand):
+- `SettingsContext` — LLM selection, inference params, tool configs, cache settings
+- `ChatHistoryContext` — Session list, current session CRUD
+- `AgentDirectoryContext` — Agent catalog (shared + custom)
+- `WebsiteGeneratorContext` — Specialized state for one page
+
+**Backend persistence**:
+- Electron Store for app configuration (user data path, AWS credentials)
+- Chat sessions persisted to JSON files in `~/.bedrock-engineer/chat-sessions/`
+
+---
+
+## **6. LLM Provider Abstraction**
+
+### **Primary Provider: AWS Bedrock Only**
+
+No fallback to other LLM providers; architecture is Bedrock-centric.
+
+### **Supported Model Classes** ([models.ts](reference/bedrock-engineer/src/common/models/models.ts#L1-L30)):
+
+| Category | Examples | Type |
+|----------|----------|------|
+| **Anthropic Claude** | Claude 3.5 Sonnet, Opus, Haiku | Text generation |
+| **Amazon Nova** | Nova Pro, Nova Lite | Text generation (lower cost) |
+| **Open-source** | Llama 2/3, Mistral | Via Bedrock |
+| **Specialized** | Stable Diffusion, Titan Image | Image generation |
+
+### **Streaming & Caching**:
+- **Streaming**: Native streaming via `ConverseStreamCommand`
+- **Prompt Caching**: Supported via `PromptCacheManager` ([promptCache.ts](reference/bedrock-engineer/src/common/models/promptCache.ts#L1-L10))
+  - Optional toggle in settings (`enablePromptCache`)
+  - Cache points tracked per session
+- **Thinking Mode**: Extended thinking for Claude 3.7 Sonnet (opt-in toggle)
+- **Interleaved Thinking**: Thinking output streamed inline with text
+
+### **Multi-region failover**:
+- Automatic fallover on throttling (`getAlternateRegionOnThrottling`)
+- Inference profiles for cross-region execution
+
+---
+
+## **7. Tool System**
+
+### **25 Built-in Tools** ([tools.ts](reference/bedrock-engineer/src/types/tools.ts#L4-L35)):
+
+#### **Filesystem Operations** (src/preload/tools/handlers/filesystem/):
+- `readFiles` — Read one or more files with optional line ranges
+- `writeToFile` — Create/overwrite files
+- `createFolder` — Directory creation
+- `listFiles` — Directory listing (recursive, depth control, ignore patterns)
+- `moveFile`, `copyFile` — File operations
+- `applyDiffEdit` — Unified diff patching
+
+#### **Web/Search**:
+- `fetchWebsite` — HTTP GET with content extraction
+- `tavilySearch` — Web search via Tavily API
+
+#### **Image/Video**:
+- `generateImage` — Stable Diffusion (AWS Bedrock)
+- `generateVideo` — Video generation
+- `checkVideoStatus`, `downloadVideo` — Video lifecycle
+- `recognizeImage` — Image-to-text (Claude Vision)
+
+#### **Bedrock-specific**:
+- `invokeBedrockAgent` — Call other Bedrock agents (multi-agent pattern)
+- `invokeFlow` — AWS Bedrock Flows
+- `retrieve` — Knowledge Base retrieval
+
+#### **System/Environment**:
+- `executeCommand` — Shell command execution (bash/PowerShell)
+- `screenCapture` — Screenshot capture
+- `cameraCapture` — Webcam frame capture
+- `codeInterpreter` — Python code execution (container-based)
+
+#### **Knowledge/Reasoning**:
+- `think` — Explicit reasoning step (fallback for models without native thinking)
+
+#### **Productivity**:
+- `todo`, `todoInit`, `todoUpdate` — Task list management
+
+#### **MCP**:
+- `mcp` — Generic MCP tool adapter
+
+### **Tool Definition & Registration** ([registry.ts](reference/bedrock-engineer/src/preload/tools/registry.ts#L1-L50)):
+
+Tools registered in TypeScript class hierarchy:
+- Each tool extends `BaseTool<Input, Result>`
+- Static `toolSpec: Tool['toolSpec']` provides JSON schema for Bedrock
+- `toolName` property (e.g., `'createFolder'`)
+
+Example ([CreateFolderTool.ts](reference/bedrock-engineer/src/preload/tools/handlers/filesystem/CreateFolderTool.ts#L1-L30)):
+```typescript
+export class CreateFolderTool extends BaseTool<CreateFolderInput, ...> {
+  static readonly toolName = 'createFolder'
+  static readonly toolSpec: Tool['toolSpec'] = {
+    name: 'createFolder',
+    description: '...',
+    inputSchema: { json: { type: 'object', properties: {...} } }
+  }
+}
+```
+
+### **Tool Call Parsing & Dispatch**:
+
+**Frontend**: [useAgentChat.ts](reference/bedrock-engineer/src/renderer/src/pages/ChatPage/hooks/useAgentChat.ts#L1-L30)
+- Streams tool results from `streamChatCompletion`
+- Extracts tool use blocks from response
+- Invokes IPC handler for each tool call
+
+**Backend**: [SonicToolExecutor.ts](reference/bedrock-engineer/src/main/api/sonic/tool-executor/SonicToolExecutor.ts#L1-L40)
+- Parses tool name & input from Bedrock response
+- Routes to correct handler via tool registry
+- Captures result (success + output or error)
+- Returns formatted tool result block
+
+### **MCP Support** ([mcp/index.ts](reference/bedrock-engineer/src/main/mcp/index.ts#L1-L95)):
+
+- Full MCP SDK integration (`@modelcontextprotocol/sdk` v1.26.0)
+- Configuration: command-based (local binaries) or HTTP URL
+- Tool discovery: Automatic from MCP server schema
+- Tool execution: Routed through `McpToolAdapter`
+- Caching: Config change detection avoids reconnect thrashing
+- Error handling: Logs server connection failures
+
+### **Sandboxing & Permission Model**:
+
+**User filesystem access**:
+- No absolute sandboxing; operates on user's home directory
+- Project path selectable per session
+- File operations scoped to user data dir + project path
+
+**Shell execution**:
+- `executeCommand` runs arbitrary shell commands (no sandboxing)
+- Subprocess spawned with inherited environment
+
+**Approval flow**:
+- **No approval step**: UI sends tool specs to LLM; LLM decides to use
+- **User control**: Tool enable/disable toggles in Settings → Agent Tools
+- **MCP tools**: Must be registered before use
+
+---
+
+## **8. Prompt / System Message Strategy**
+
+### **Dynamic System Prompt Generation** ([SystemPromptBuilder](reference/bedrock-engineer/src/common/agents/toolRuleGenerator.ts#L1-L100)):
+
+Sections composited per session:
+1. **Base system prompt** — Custom agent system instruction
+2. **Context block**:
+   ```
+   - working directory: {{projectPath}}
+   - date: {{date}}
+   - current mode: ACT/PLAN
+   ```
+3. **Project rules** — Loaded from `.bedrock-engineer/rules/` YAML/MD
+4. **Visual expression rules** — Mermaid/draw.io/KaTeX/image markdown
+5. **ACT/PLAN mode rules** — Tool constraints per mode
+6. **Tool descriptions** — Injected dynamically based on agent config
+7. **Environment context** — Git branch, OS info, Node version (optional)
+
+### **Placeholder Substitution** ([replacePlaceholders](reference/bedrock-engineer/src/common/utils/placeholderUtils.ts)):
+- `{{projectPath}}` → Current working directory
+- `{{date}}` → ISO date
+- `{{bedrockAgents}}` → Allowed agent list
+- Custom user variables via environment context settings
+
+### **Prompt Caching** ([PromptCacheManager](reference/bedrock-engineer/src/common/models/promptCache.ts#L8-L40)):
+- System prompt + early messages cached via Bedrock prompt cache
+- Cache efficiency: First cache point after system prompt + initial context
+- Reduces latency & cost on follow-up messages
+
+---
+
+## **9. Memory & Context Management**
+
+### **Chat History Storage**:
+- Persistent JSON file per session in `~/.bedrock-engineer/chat-sessions/{sessionId}.json`
+- Metadata index in Electron Store (`chat-sessions-meta`)
+- Messages include full content + tool results + timestamps
+
+### **Project Context**:
+- Project path selection per session (`.projectPath` store key)
+- Loaded into system prompt as `{{projectPath}}`
+- Project-local rules discovered from `.bedrock-engineer/rules/`
+
+### **Long-term / Knowledge Base**:
+- AWS Bedrock Knowledge Base integration via `retrieve` tool
+- Knowledge base ID + description stored in agent config
+- `RetrieveAndGenerateCommand` for RAG workflow
+
+### **Context Length**:
+- Configurable message window ([SettingsContext.tsx#L293](reference/bedrock-engineer/src/renderer/src/contexts/SettingsContext.tsx#L293))
+- Default: 60 messages
+- Truncation strategy: Drop oldest messages beyond limit
+
+### **Model Max Tokens**:
+- Per-model lookup: `getModelMaxTokens(modelId)` ([models.ts](reference/bedrock-engineer/src/common/models/models.ts#L985))
+- Inference params: `maxTokens`, `temperature`, `topP` (global + per-request override)
+
+---
+
+## **10. Planning Subsystem**
+
+### **PLAN Mode (Read-Only Research Phase)**
+
+From [toolRuleGenerator.ts](reference/bedrock-engineer/src/common/agents/toolRuleGenerator.ts#L1-L50):
+
+**Dual-mode architecture**:
+- **PLAN MODE**: Agent gathers context without execution
+  - Allowed tools: `readFiles`, `listFiles`, `tavilySearch`, `fetchWebsite`, `think`
+  - Goal: Create detailed plan for user review
+  - No file writes, no command execution, no agent delegation
+- **ACT MODE**: Agent executes approved plan
+  - Full tool access (except `think` becomes optional)
+  - Implements changes based on plan
+
+**Workflow**:
+1. User switches to PLAN mode via UI toggle
+2. System prompt appended with mode constraints
+3. Agent uses read-only tools to research task
+4. Outputs detailed architecture/plan as response
+5. User reviews and approves
+6. Switch to ACT mode for execution
+
+### **No explicit planner class**:
+- Planning is implicit in system prompt constraints
+- No separate planning API; handled by LLM reasoning
+
+---
+
+## **11. Sub-agents / Delegation**
+
+### **Multi-Agent Pattern via Tool**:
+
+`invokeBedrockAgent` tool ([InvokeBedrockAgentTool.ts](reference/bedrock-engineer/src/preload/tools/handlers/bedrock/InvokeBedrockAgentTool.ts#L50-L100)):
+- Agent A calls Agent B via Bedrock agent invocation
+- Passes input text + optional file attachment
+- Receives session ID (for stateful conversation)
+- Result returns message + generated files
+
+### **Shared Agent Catalog** ([agent-handlers.ts](reference/bedrock-engineer/src/main/handlers/agent-handlers.ts#L1-L50)):
+- Shared agents stored as YAML/JSON in `.bedrock-engineer/agents/`
+- Loaded on-demand via `loadSharedAgents()` IPC handler
+- Each agent is `CustomAgent` with system prompt + tool config
+
+### **No hierarchical orchestration**:
+- Agents are siblings (not tree-structured)
+- Coordination via message passing (tool results)
+
+---
+
+## **12. Human-in-the-Loop: GUI Approval UX**
+
+Rich interactive desktop UI built in React:
+
+### **Tool Enable/Disable Toggle**:
+[ToolsSection/AvailableToolsTab](reference/bedrock-engineer/src/renderer/src/pages/ChatPage/components/AgentForm/ToolsSection/components/AvailableToolsTab/):
+- Checkbox per tool category (Filesystem, Web, Bedrock, System, MCP, Thinking)
+- Tool details modal with description & schema
+- Tool-specific configuration (e.g., API key for Tavily, S3 path for video)
+
+### **Tool Result Display**:
+[MessageList/Message.tsx](reference/bedrock-engineer/src/renderer/src/pages/ChatPage/components/MessageList/Message.tsx#L1-L30):
+- Agent response streams in real-time
+- Tool calls displayed as expandable blocks (tool name + input)
+- Tool results shown inline below tool block
+- Rich markdown rendering (Mermaid, KaTeX, code blocks)
+
+### **Chat History**:
+[ChatHistory component](reference/bedrock-engineer/src/renderer/src/pages/ChatPage/components/ChatHistory/):
+- Sidebar session list with creation date + message count
+- Sessions persist across restarts
+- Rename/delete session actions
+- Metadata stored in Electron Store
+
+### **Settings/Configuration UI**:
+[SettingPage](reference/bedrock-engineer/src/renderer/src/pages/SettingPage/):
+- Model selection dropdown (filtered by region)
+- Inference params (temperature, topP, maxTokens sliders)
+- Tool-specific settings forms (API keys, paths, container configs)
+- MCP server registration (command/URL, env vars, tool list)
+- Advanced toggles (prompt cache, thinking mode, region failover)
+
+### **Agent Management**:
+[AgentForm component](reference/bedrock-engineer/src/renderer/src/pages/ChatPage/components/AgentForm/):
+- Modal to create/edit agent
+- Sections: Basic info, System Prompt, Tools, Knowledge Bases, MCP Servers
+- Drag-drop agent directory with pre-built agents
+- "Developer for Bedrock Engineer" template included
+
+### **No explicit approval workflow**:
+- User manually selects which tools are available
+- LLM decides tool use; user sees results before next turn
+- Can edit system prompt/tools mid-conversation
+
+---
+
+## **13. Sandboxing / Safety**
+
+### **Filesystem Access**:
+- **No strict sandbox**: Operates on user's home dir + project path
+- Files only readable/writable within selected project directory
+- `.bedrock-engineer/` directory is user-controlled config space
+
+### **Shell Execution**:
+- `executeCommand` spawns subprocess without restriction
+- Runs with inherited environment + user's PATH
+- No containerization (except `codeInterpreter` which uses Docker/Podman)
+
+### **Code Interpretation**:
+[CodeInterpreterTool.ts](reference/bedrock-engineer/src/preload/tools/handlers/interpreter/CodeInterpreterTool.ts#L35-L50):
+- Containerized Python execution (Docker/Podman)
+- Configuration: [CodeInterpreterContainerConfig](reference/bedrock-engineer/src/types/agent-chat.ts#L1-L30)
+- Isolated from host filesystem (no direct host file access)
+
+### **API Security**:
+- AWS credentials stored in Electron Store (encrypted by OS keychain on macOS/Windows)
+- Proxy support for corporate networks
+- MCP server credentials via environment variables (not logged)
+
+### **No data sanitization**:
+- LLM responses streamed directly to UI
+- Markdown/code blocks rendered client-side (Monaco, Mermaid)
+- XSS risk mitigated by React's built-in escaping
+
+---
+
+## **14. Observability: Telemetry & Logs**
+
+### **Logging Architecture** ([logger/index.ts](reference/bedrock-engineer/src/common/logger/index.ts#L1-L100)):
+
+**Winston-based multi-transport**:
+- File transport: Daily rotating logs to `~/.bedrock-engineer/logs/`
+- Console transport: Dev-time logging
+- Configurable log levels (error, warn, info, debug, verbose)
+
+**Category loggers**:
+```typescript
+const converseLogger = createCategoryLogger('bedrock:converse')
+const mcpLogger = createCategoryLogger('mcp')
+const backgroundAgentLogger = createCategoryLogger('background-agent')
+```
+
+### **Logged Events**:
+- **API calls**: Model ID, region, message count, response tokens
+- **Tool execution**: Tool name, input params, execution time, result size
+- **MCP operations**: Server connect/disconnect, tool discovery, execution
+- **Background agent**: Session creation, chat completion, tool runs
+- **Errors**: Full stack traces, AWS error codes, retry attempts
+
+### **No telemetry to external service**:
+- Logs stored locally only
+- User can disable console/file logging via config
+- Chat content NOT automatically logged (only tool execution metadata)
+
+### **Metrics/Analytics UI**:
+[useTokenAnalyticsModal](reference/bedrock-engineer/src/renderer/src/pages/ChatPage/modals/useTokenAnalyticsModal.tsx#L1-L30):
+- Token usage per message (input/output breakdown)
+- Cost estimation via `PricingCalculator` ([pricing.ts](reference/bedrock-engineer/src/common/models/pricing.ts#L7))
+- Cumulative session cost tracking
+
+---
+
+## **15. Evaluation / Testing**
+
+### **Test Files** (from jest configs):
+
+**Unit tests** ([jest.config.js](reference/bedrock-engineer/jest.config.js)):
+```
+**/__tests__/** → Unit test files
+```
+
+**Integration tests** ([jest.integration.config.js](reference/bedrock-engineer/jest.integration.config.js)):
+```
+**/__tests__/agent*.integration.test.ts → Bedrock API tests
+**/__tests__/flow*.integration.test.ts → Flow invocation tests
+```
+
+### **Example Test** ([agentService.integration.test.ts](reference/bedrock-engineer/src/main/api/bedrock/__tests__/agentService.integration.test.ts#L60-L80)):
+```typescript
+test('should successfully invoke agent with basic input', async () => {
+  const result = await agentService.invokeAgent({
+    agentId: '...',
+    agentAliasId: '...',
+    inputText: 'What is 2 + 2?'
+  })
+  expect(result.completion.message).toBeDefined()
+})
+```
+
+### **No automated evaluation framework**:
+- Manual testing via UI
+- Integration tests for Bedrock API integration
+- No A/B testing or prompt evaluation
+
+---
+
+## **16. Configuration: Settings UI & Config Files**
+
+### **Settings UI Tabs** ([SettingPage](reference/bedrock-engineer/src/renderer/src/pages/SettingPage/)):
+1. **Model Settings**: Region, model selection, inference params
+2. **Tool Settings**: Per-tool API keys, paths, container configs
+3. **MCP Servers**: Register/connect MCP servers
+4. **Project Settings**: Select project directory
+5. **Advanced**: Prompt cache, thinking mode, region failover, guardrails
+6. **Notifications**: Enable/disable toast notifications
+7. **Agent Tools**: Global tool enable/disable per category
+
+### **Electron Store Persistence** ([preload/store.ts](reference/bedrock-engineer/src/preload/store.ts#L1-L30)):
+- Stores: AWS credentials, model selection, project path, tool configs, agent list
+- Encrypted by OS keychain (macOS/Windows)
+- Persisted to `~/.bedrock-engineer/config.json`
+
+### **Agent Config Format** ([agent-chat.schema.ts](reference/bedrock-engineer/src/types/agent-chat.schema.ts#L35-L150)):
+
+**YAML/JSON structure**:
+```yaml
+id: agent-001
+name: Senior Frontend Developer
+icon: react
+description: Helps with React development
+system: |
+  You are an expert React developer...
+tools:
+  - readFiles
+  - writeToFile
+  - executeCommand
+  - tavilySearch
+mcpServers:
+  - name: filesystem
+    command: mcp-server-filesystem
+    args: ['/projects']
+knowledgeBases:
+  - knowledgeBaseId: kb-123
+    description: React docs
+environmentContextSettings:
+  loadGitInfo: true
+  loadSystemInfo: true
+contextLength: 60
+enablePromptCache: true
+```
+
+### **Shared Agent Templates** ([directory-agents/](reference/bedrock-engineer/src/renderer/src/assets/directory-agents/)):
+- Pre-built YAML agents (Senior Frontend Developer, AWS CloudWatch Tracker, MCP Server Builder, etc.)
+- Importable via Agent Directory modal
+
+---
+
+## **17. Entry Points: Launch & Main Window Flow**
+
+### **Application Startup** ([src/main/index.ts](reference/bedrock-engineer/src/main/index.ts#L1-L50)):
+
+```typescript
+// Main entry point
+app.on('ready', async () => {
+  initLoggerConfig(userDataPath)
+  initLogger()
+  registerIpcHandlers()  // Register all IPC handlers
+  await createWindow()   // Create Electron main window
+  createServer()         // Start Express server for IPC
+})
+
+async function createWindow(): Promise<void> {
+  // Create BrowserWindow
+  // Load preload script
+  // Set up IPC communication bridge
+}
+```
+
+### **Preload Bridge** ([preload/index.ts](reference/bedrock-engineer/src/preload)):
+- Exposes safe IPC API to renderer via `window.api`
+- Methods: `streamChatCompletion`, `executeTool`, `getSettings`, `listModels`, etc.
+
+### **First-run UX** ([HomePage](reference/bedrock-engineer/src/renderer/src/pages/HomePage/)):
+- Welcome screen
+- AWS credential input (Access Key + Secret)
+- Region selection
+- Project directory selection
+- Button to go to Chat
+
+### **Main Chat Flow** ([ChatPage.tsx](reference/bedrock-engineer/src/renderer/src/pages/ChatPage/ChatPage.tsx#L1-L50)):
+
+1. User selects agent from sidebar
+2. System prompt auto-generated (base + tools + environment context)
+3. User types message in input box (Shift+Enter or Cmd+Enter to send)
+4. Message sent via `streamChatCompletion` IPC call
+5. Response streamed: text chunks → tool calls → tool results
+6. Messages added to session history
+7. Session persisted to JSON file
+
+### **Window Lifecycle**:
+- Single main window (no multiple chat windows)
+- Additional windows: Camera preview (camera-preview.html), Task history (background agent)
+- Minimize/maximize to system tray (configurable)
+
+---
+
+## **18. Notable Idioms & Patterns**
+
+### **Electron IPC Pattern**:
+- **Main ↔ Renderer**: Express-based socket.io + ipcMain handlers
+- **Type safety**: TypeScript overloads for each handler
+- **Error handling**: Caught errors returned as rejection in Promise
+
+Example ([ipc-handler.ts](reference/bedrock-engineer/src/main/lib/ipc-handler.ts#L1-L40)):
+```typescript
+registerIpcHandler(
+  'bedrock:converse',
+  async (args: ConverseInput) => converseService.converse(args)
+)
+// Automatically bridges to renderer via preload
+```
+
+### **React Context + Hooks**:
+- No Redux; state management via Context + useState
+- `useSettings()`, `useChatHistory()`, `useAgentDirectory()` hooks
+- Settings persisted immediately to Electron Store
+
+### **Service Layer + DI**:
+- `ServiceContext` passed to all service classes
+- Contains `store` (Electron Store reference)
+- Enables dependency injection without external DI framework
+
+### **Tool Registry Pattern**:
+- Tool classes extend `BaseTool<Input, Output>`
+- Static `toolSpec` for schema
+- Registry maps tool name → handler class
+- Tools instantiated on-demand per execution
+
+### **Streaming Responses**:
+- Generator function: `async function* streamChatCompletion(...)`
+- Frontend consumes via for-await loop
+- Enables real-time message streaming to UI
+
+### **Monorepo-like Structure**:
+- Shared types & utilities in `src/common/`
+- Minimal coupling between main/renderer
+- Clear API boundary via IPC
+
+---
+
+## **19. Data Flow Diagram (Textual)**
+
+### **User Message → LLM Response → Tool → Result Cycle**
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ RENDERER (React UI)                                              │
+│                                                                  │
+│  User Types Message                                              │
+│         ↓                                                         │
+│  ChatPage.handleSubmit()                                         │
+│         ↓                                                         │
+│  useAgentChat.streamChat()                                       │
+│         ↓                                                         │
+│  window.api.streamChatCompletion({                               │
+│    modelId, messages, system, tools, ...                         │
+│  })                                                              │
+│         ↓                                                         │
+└─────────────────────────────────────────────────────────────────┘
+                            ↓ IPC/Socket.io
+┌─────────────────────────────────────────────────────────────────┐
+│ MAIN PROCESS (Node.js)                                           │
+│                                                                  │
+│  bedrock-handlers.ts: 'stream:chat'                              │
+│         ↓                                                         │
+│  ConverseService.converseStream({                                │
+│    modelId, messages, system, toolConfig                         │
+│  })                                                              │
+│         ↓                                                         │
+│  BedrockRuntimeClient.send(ConverseStreamCommand)                │
+│         ↓                                                         │
+│  [BEDROCK API - AWS]                                             │
+│    ├─ Processes system prompt + context                          │
+│    ├─ Generates text response                                    │
+│    └─ Returns: text || tool_use block                            │
+│         ↓                                                         │
+│  Response Stream (RxJS Subject)                                  │
+│    ├─ ContentBlock[] per chunk                                   │
+│    └─ Tool use detected: { type: 'toolUse', name, input }        │
+│         ↓                                                         │
+│  SonicToolExecutor.processToolUse(toolName, input)               │
+│         ↓                                                         │
+│  Tool Registry.execute(toolName, input)                          │
+│         ↓                                                         │
+│  Tool Handler (e.g., WriteToFileTool)                            │
+│    ├─ Validate input                                             │
+│    ├─ Execute (fs.writeFile)                                     │
+│    └─ Return: { success: true, result: ... }                     │
+│         ↓                                                         │
+│  Format Tool Result Block                                        │
+│         ↓                                                         │
+└─────────────────────────────────────────────────────────────────┘
+                            ↓ Stream back to Renderer
+┌─────────────────────────────────────────────────────────────────┐
+│ RENDERER                                                         │
+│                                                                  │
+│  for await (chunk of streamChatCompletion) {                     │
+│    if (chunk.type === 'text') setMessages([...msg, chunk])       │
+│    if (chunk.type === 'toolResult') displayToolResult()          │
+│  }                                                               │
+│         ↓                                                         │
+│  MessageList renders:                                            │
+│    [User message]                                                │
+│    [Assistant response + tool blocks + results]                  │
+│         ↓                                                         │
+│  Add to ChatHistory (store)                                      │
+│    → ChatSessionManager.addMessage(sessionId, message)           │
+│         ↓                                                         │
+│  Persist to disk: ~/.bedrock-engineer/chat-sessions/{id}.json    │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### **Background Agent Scheduled Execution**
+
+```
+Scheduler (node-cron)
+   ↓
+background-agent:chat IPC
+   ↓
+BackgroundAgentService.chat()
+   ├─ ResolveAgent(agentId)
+   ├─ ConverseService.converseStream()
+   ├─ Tool execution loop (same as above)
+   └─ Accumulate all results
+   ↓
+BackgroundAgentScheduler
+   ├─ Update task execution history
+   ├─ Emit pub-sub event to renderer
+   └─ Persist session
+```
+
+---
+
+## **20. Weaknesses & Gaps**
+
+### **Architectural Gaps**:
+
+1. **No TypeScript strict mode**: Lots of `any` types in tool definitions and API responses
+   - [`InvokeBedrockAgentResult` omits file handling](reference/bedrock-engineer/src/preload/tools/handlers/bedrock/InvokeBedrockAgentTool.ts#L20-L30)
+
+2. **Minimal error recovery**: Failed tool executions cause chat to pause
+   - No automatic retry logic for transient failures
+   - No fallback strategies
+
+3. **Context truncation is naive**: Oldest-first drop for context overflow
+   - No importance weighting or smart summarization
+   - Long conversations lose critical early context
+
+4. **No prompt optimization**: System prompts are static composites
+   - No A/B testing or prompt versioning
+   - No automated prompt engineering
+
+5. **Planning mode not fully automated**: Requires manual ACT mode switch
+   - No automatic transition after plan review
+   - No validation that plan was followed during ACT
+
+6. **Session state not shared**: Background agent sessions isolated from main chat
+   - No cross-session context sharing
+   - Multi-turn coordination requires explicit tool calls
+
+### **Performance Gaps**:
+
+7. **No caching of tool schemas**: Tool specs regenerated per session
+   - Could cache immutable schemas globally
+
+8. **No background tool pre-warming**: MCP servers connect on first use
+   - Adds latency to first tool call
+
+9. **File I/O not batched**: Each file op is a separate IPC call
+   - `listFiles` recursive traversal is blocking
+
+10. **No streaming response buffering**: Each content block is a separate socket.io message
+    - Could batch small chunks for efficiency
+
+### **Observability Gaps**:
+
+11. **No distributed tracing**: Tool execution across main/renderer/MCP not traced
+    - Difficult to debug latency issues
+
+12. **No structured logging for all components**: Only bedrock/mcp have category loggers
+    - Renderer logging goes to console only
+
+13. **No metrics collection**: No latency histograms, error rates, tool usage statistics
+
+14. **No audit logging**: No record of which agents ran, what tools executed, by whom
+
+### **Security Gaps**:
+
+15. **No input validation in tool handlers**: LLM directly controls tool input
+    - Path traversal risk in file tools (mitigated by project scope, but not enforced)
+
+16. **Credentials stored in Electron Store**: Encrypted by OS, but accessible to any process as same user
+
+17. **No MCP server authentication**: MCP servers trusted implicitly
+
+18. **No rate limiting**: Unbounded tool execution (e.g., 1000 API calls in loop)
+
+### **UX Gaps**:
+
+19. **No tool execution progress indication**: Background agent tasks not visible in UI
+
+20. **No agent chaining UI**: Multi-agent workflows require manual tool calls
+
+21. **No session branching**: Can't fork conversation at a point and explore alternatives
+
+22. **No inline agent editing**: Must close chat to edit agent system prompt
+
+---
+
+## **Summary Statistics**
+
+| Metric | Value |
+|--------|-------|
+| **Total built-in tools** | 25 |
+| **Supported LLM providers** | 1 (Bedrock only) |
+| **React Context providers** | 4 |
+| **Main process handlers** | 12+ (bedrock, file, agent, background-agent, mcp, etc.) |
+| **Tool categories** | 9 (filesystem, web, bedrock, system, thinking, productivity, interpreter, mcp, command) |
+| **Supported model classes** | 4+ (Claude, Nova, Llama, Mistral) |
+| **Package dependencies** | 50+ direct |
+| **Lines of TypeScript** | ~50,000+ (estimate) |
+| **Test files** | ~20 (unit + integration) |
+| **Internationalization** | 2 languages (English, Japanese) |
+
+This architecture exemplifies a **production desktop AI agent application** with strong focus on developer UX, rich tool ecosystem, and tight AWS Bedrock integration. The dual PLAN/ACT mode and background scheduling are distinctive patterns for autonomous software development agents.

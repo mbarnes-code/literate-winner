@@ -1,0 +1,879 @@
+Now I'll compile a comprehensive analysis of the open-swe repository. Based on my thorough exploration, here's the detailed technical reference:
+
+---
+
+# **Open SWE Repository Analysis**
+
+## **1. Project Identity & Purpose**
+
+**What it is:** Open SWE is an open-source framework for building organizational internal coding agents — agentic tools that automatically handle software engineering tasks (code changes, refactoring, bug fixes, CI/CD troubleshooting) and can be invoked from Slack, Linear tickets, GitHub PR comments, or a web dashboard.
+
+**Problem domain:** Coding agent automation with enterprise-grade safety, sandboxing, and control. It's inspired by internal systems at Stripe (Minions), Ramp (Inspect), and Coinbase (Cloudbot) but open-sourced and composable on top of LangGraph + Deep Agents.
+
+**Source:** [README.md](README.md) lines 1–100; [AGENTS.md](AGENTS.md) project section.
+
+---
+
+## **2. Languages & Runtime**
+
+- **Primary language:** Python (backend agent logic)
+- **UI/Desktop:** TypeScript/React (Vite + Electron)
+- **Python version:** `requires-python = ">=3.11"` ([pyproject.toml](pyproject.toml) line 5); LangGraph runtime pinned to 3.12 in [langgraph.json](langgraph.json) line 2
+- **Package manager:** `uv` (unified Python package installer)
+- **Build system:** Hatchling (wheel build backend)
+- **Monorepo structure:** pnpm workspaces for Node projects (Dashboard UI, Desktop Electron app, E2E tests)
+- **Test framework:** pytest with asyncio (`.asyncio_mode = "auto"` in [pyproject.toml](pyproject.toml) line 108)
+- **Linting/formatting:** ruff (line-length 100, target py311); basedpyright for type checking
+
+---
+
+## **3. Dependencies**
+
+### Core Agent Framework
+- **deepagents==0.7.6** — Agent orchestration framework with middleware, skills, subagent delegation
+- **langgraph>=1.2.10** — State graph execution engine for LangGraph apps
+- **langgraph-sdk>=0.4.2** — Client SDK for triggering/monitoring runs
+- **langchain>=1.3.9** — Base LLM abstractions and utilities
+- **langchain-core** (transitive) — Core message types, runnable interfaces
+
+### LLM Provider SDKs
+- **langchain-openai>=1.4.1,<2.0.0** — OpenAI GPT integration
+- **langchain-anthropic>=1.5.4** — Anthropic Claude integration
+- **langchain-fireworks>=1.5.2** + **fireworks-ai>=1.2.5** — Fireworks AI integration
+- **langchain-google-genai>=4.3.2** — Google Gemini integration
+
+### Sandbox Providers
+- **langchain-daytona>=0.0.8** — Daytona sandbox integration
+- **langchain-modal>=0.0.6** — Modal cloud function integration
+- **langchain-runloop>=0.0.7** — Runloop sandbox integration
+- **langchain-e2b==0.0.6** — E2B sandbox integration
+
+### Observability & Tracing
+- **langsmith>=0.11.1** — LangSmith trace logging and LLM Gateway routing
+- **langchain-mcp-adapters>=0.3.1** — Model Context Protocol adapter for tool integration
+
+### Web & Utilities
+- **fastapi>=0.141.1** — REST API framework for webhooks and dashboard backend
+- **uvicorn>=0.52.0** — ASGI server
+- **httpx>=0.28.1** — Async HTTP client
+- **PyJWT>=2.12.1** — JWT token signing/verification
+- **cryptography>=50.0.0** — Secret encryption at rest
+- **markdownify>=1.2.3** — HTML to Markdown conversion
+- **exa-py>=2.16.2** — Web search integration (via Exa API)
+- **stagehand>=3.22.0** — Browser automation for DOM interaction
+- **websockets>=15.0.1** — WebSocket support
+
+### Dev Dependencies
+- pytest, pytest-asyncio, ruff, basedpyright, Pygments
+
+**Source:** [pyproject.toml](pyproject.toml) lines 7–43.
+
+---
+
+## **4. Top-Level Directory Layout**
+
+| Directory | Purpose |
+|---|---|
+| **`agent/`** | Main agent implementation: graphs, tools, middleware, integrations, dashboard backend. Largest subsystem. |
+| **`ui/`** | React/TypeScript web dashboard (Vite-based). User settings, thread management, review interface. |
+| **`desktop/`** | Electron wrapper around the same dashboard for local machine integration. |
+| **`docs/`** | Documentation (CUSTOMIZATION.md, INSTALLATION.md, etc.). |
+| **`tests/`** | Comprehensive test suite: pytest tests for agent, webhooks, tools, middleware, sandbox integrations. |
+| **`evals/`** | Evaluation suites for reviewer agent. |
+| **`examples/`** | Example configurations and CI workflows. |
+| **`scripts/`** | Utility scripts (deployment, setup). |
+| **`assets/`** | Logo and branding. |
+| **`openwiki/`** | Internal wiki/documentation (if present in this fork). |
+
+**Configuration files:**
+- [langgraph.json](langgraph.json) — Graph entrypoints and LangGraph runtime config
+- [Dockerfile](Dockerfile) — Production container image
+- [Dockerfile.sandbox](Dockerfile.sandbox) — Custom sandbox snapshot base image
+- [Makefile](Makefile) — Development commands (install, dev, test, lint, format, typecheck)
+- [package.json](package.json) — Node.js workspace root config with pnpm
+- [pyproject.toml](pyproject.toml) — Python project metadata and dependencies
+- [pnpm-workspace.yaml](pnpm-workspace.yaml) — pnpm monorepo configuration
+- [turbo.json](turbo.json) — Turbo build orchestration config
+
+---
+
+## **5. Agent Architecture**
+
+### **Five-Graph Multi-Agent System**
+
+Open SWE runs as multiple LangGraph graphs, each serving a distinct role:
+
+| Graph | Entrypoint | Purpose |
+|---|---|---|
+| **agent** | [agent/graphs/agent.py](agent/graphs/agent.py): `traced_agent` | Main coding agent triggered from Slack/Linear/GitHub. Multi-turn, stateful, sandbox-backed. |
+| **reviewer** | [agent/graphs/reviewer.py](agent/graphs/reviewer.py): `traced_reviewer_agent` | Read-only PR code reviewer. Single-pass, deterministic repo checkout, emits structured findings. |
+| **analyzer** | [agent/graphs/analyzer.py](agent/graphs/analyzer.py): `traced_analyzer` | Learns per-repo review style from historical PR feedback and finding outcomes. Bootstraps and continually refines. |
+| **chat** | [agent/chat.py](agent/chat.py): `traced_chat_agent` | Stateless read-only "chat with this PR" for review UI. No sandbox; uses virtual `/pr/` files. |
+| **scheduler** | [agent/graphs/scheduler.py](agent/graphs/scheduler.py): `get_scheduler` | Deterministic cron task fanout for `/baby-sit` PR watch automation. |
+
+**Source:** [langgraph.json](langgraph.json) and individual graph files above.
+
+### **Graph Factory Pattern**
+
+Each graph is constructed dynamically per-thread in a factory function (e.g., `get_agent(config)` in [agent/server.py](agent/server.py) line ~1) that resolves:
+- The model (OpenAI, Anthropic, Fireworks, Google, etc.) with fallback chaining
+- Per-thread sandbox (get-or-create with idempotent reconnection)
+- Team/profile/user settings (model, effort, repo defaults)
+- Curated tool list + middleware stack
+- System prompt with dynamic context (AGENTS.md, repo instructions, source channel guidance)
+
+**Architecture pattern:** Composed on Deep Agents (`create_deep_agent()` in [agent/server.py](agent/server.py) line ~290).
+
+### **Single-Agent vs. Multi-Agent**
+
+- **Primary agent:** Single "main" agent per invocation thread (one sandbox per thread, persistent across turns).
+- **Subagents:** Spawned via the `task` tool (from Deep Agents) for parallel, isolated subtasks. Each subagent gets its own model call limit, middleware stack, and sandbox file context (not a separate sandbox instance).
+- **Hierarchical aspect:** Parent agent can fan out independent research/code review tasks to subagents with different system prompts or effort levels.
+
+**Source:** [agent/server.py](agent/server.py) line ~150 (DEEP_AGENT_TOOL_NAMES shows `task` subagent support); [AGENTS.md](AGENTS.md) "Orchestration — Subagents + Middleware" section.
+
+### **State Management**
+
+- **Per-thread sandbox state:** In-memory dict keyed by `thread_id` ([agent/utils/sandbox_state.py](agent/utils/sandbox_state.py) line 128 `SANDBOX_BACKENDS`)
+- **Persistent metadata:** Thread metadata stored in LangGraph (resolved via `await client.threads.get(thread_id)`)
+- **State contents:** `ThreadSettings` TypedDict with model_id, effort, repo_instructions, owner_login ([agent/utils/thread_settings.py](agent/utils/thread_settings.py) line 27)
+- **Message/history representation:** Standard LangChain `BaseMessage` types (HumanMessage, ToolMessage, AIMessage); structured via `RunInput`/`RunMessage` for application-owned inputs ([agent/input_messages.py](agent/input_messages.py) lines 52–60)
+
+**State lifecycle:**
+1. **Checkpoint before each step** (`durability="sync"` in dispatch config) — crash-safe resumption
+2. **Checkpointed turn diffs** ([agent/utils/turn_checkpoint.py](agent/utils/turn_checkpoint.py)) at run start/completion for changed-file tracking
+3. **Thread metadata persistence** — settings, sandbox_id, model, repo, etc. stored durably in LangGraph
+
+**Source:** [agent/utils/sandbox_state.py](agent/utils/sandbox_state.py), [agent/utils/thread_settings.py](agent/utils/thread_settings.py), [agent/dispatch.py](agent/dispatch.py).
+
+---
+
+## **6. LLM Provider Abstraction**
+
+### **Model Routing & Gateway**
+
+- **Model IDs** use prefixed format: `"openai:gpt-4o"`, `"anthropic:claude-3-5-sonnet"`, `"fireworks:accounts/..."`, `"google_genai:gemini-2.0-flash"` ([agent/utils/model.py](agent/utils/model.py) line ~180)
+- **LLM Gateway support:** Optional LangSmith LLM Gateway routing via `LANGSMITH_GATEWAY_ENABLED`; when on, provider base_url/api_key are overridden ([agent/utils/model.py](agent/utils/model.py) line ~170–180)
+- **Desktop OpenAI OAuth:** Desktop app can invoke OpenAI via OAuth without hardcoded keys ([agent/utils/model.py](agent/utils/model.py) line ~165)
+
+### **Providers Supported**
+
+| Provider | Model IDs | Reasoning | Notes |
+|---|---|---|---|
+| **OpenAI** | `openai:gpt-4o`, `openai:gpt-4-turbo`, etc. | Native via Responses API | Effort: none/low/medium/high/xhigh/max; summary: auto/concise/detailed |
+| **Anthropic** | `anthropic:claude-3-5-sonnet` | Native thinking blocks | Effort: low/medium/high/xhigh/max; thinking: adaptive (summarized/omitted) |
+| **Google GenAI** | `google_genai:gemini-2.0-flash` | Native thinking | Thinking levels: minimal/low/medium/high |
+| **Fireworks** | `fireworks:accounts/...` | Native reasoning | Effort: none/low/medium/high/xhigh/max |
+| **LLM Gateway** | Any provider via proxy | Transparent override | `LANGSMITH_GATEWAY_ENABLED` |
+| **Local/Ollama** | `ollama:mistral`, etc. (via langchain) | Via init_chat_model | Dev only |
+
+### **Model Fallback Chain**
+
+- **Cross-provider fallback:** Anthropic primaries fall back to OpenAI and vice versa ([agent/utils/model.py](agent/utils/model.py) line ~380 `fallback_model_id_for`)
+- **ModelFallbackMiddleware:** Catches provider errors and retries with fallback ([agent/middleware/model_fallback.py](agent/middleware/model_fallback.py))
+- **Per-model timeouts:** 600s (10 min) per request; escalates to fallback on timeout ([agent/utils/model.py](agent/utils/model.py) line ~17 `DEFAULT_REQUEST_TIMEOUT_SECONDS`)
+
+### **Streaming**
+
+- Supported: Tools/updates/values streaming for dashboard UI via `stream_mode` config
+- V2 protocol with subgraph namespacing for nested subagent visibility
+
+**Source:** [agent/utils/model.py](agent/utils/model.py), [agent/providers/__init__.py](agent/providers/__init__.py), [agent/middleware/model_fallback.py](agent/middleware/model_fallback.py), [agent/utils/gateway.py](agent/utils/gateway.py).
+
+---
+
+## **7. Tool System**
+
+### **Tool Definition**
+
+Tools are flat-imported from [agent/tools/__init__.py](agent/tools/__init__.py) and registered via Deep Agents' tool discovery. No explicit JSON schema needed — langchain auto-converts function signatures.
+
+**Pattern (example from [agent/tools/web_search.py](agent/tools/web_search.py)):**
+```python
+async def web_search(query: str, num_results: int = 5, include_contents: bool = True) -> dict[str, Any]:
+    """Search the web using Exa..."""
+    # Function body with docstring describing behavior
+    return {"success": bool, "results_path": str, "error": str | None}
+```
+
+### **Built-In Tools (Deep Agents Foundation)**
+
+From [agent/server.py](agent/server.py) line ~130:
+- `read_file`, `write_file`, `edit_file`, `delete` — File operations in sandbox
+- `execute` — Shell commands with timeout (default 300s, configurable)
+- `ls`, `glob`, `grep` — File listing and content search
+- `task` — Spawn isolated subagent for parallel work
+
+### **Curated Agent Tools** (~25 total)
+
+**Execution & Code:**
+- `background_execute`, `background_task` — Long-running async operations
+- `execute` (deep agent) — Shell commands in sandbox
+- `capture_environment_snapshot`, `save_environment`, `delete_environment` — Sandbox state snapshots
+- `recreate_sandbox` — Full sandbox replacement (rare; only on explicit user request)
+
+**Communication:**
+- `slack_thread_reply` — Post to Slack thread
+- `slack_add_reaction` — React to Slack message
+- `slack_move_thread` — Move thread to another Slack thread
+- `slack_start_new_thread` — Create new Slack thread
+- `slack_read_thread_messages` — Read thread history
+- `linear_comment` — Post comment to Linear issue
+- `linear_create_issue`, `linear_update_issue`, `linear_delete_issue` — Linear CRUD
+- `linear_search_issues`, `linear_get_issue`, `linear_get_issue_comments`, `linear_list_teams` — Linear queries
+
+**Code & Repo Management:**
+- `open_pull_request` — Create/update draft PR (attributed to user token when available, else bot token)
+- `request_pr_review` — Trigger review workflow
+
+**Planning & Collaboration:**
+- `enter_plan_mode`, `save_plan`, `approve_plan` — Multi-turn approval workflow for code changes
+- `save_user_instructions`, `read_user_settings` — Per-user custom instructions
+- `manage_thread`, `list_threads`, `get_thread` — Dashboard thread management
+- `manage_baby_sit` — PR watch automation (CI monitoring)
+
+**Research:**
+- `web_search` — Via Exa API
+- `fetch_url` — Fetch and markdownify web pages
+- `http_request` — Generic HTTP calls (GET, POST, etc.)
+
+**Output & Visualization:**
+- `output_iframe` — Render sandboxed HTML visualizations
+- `create_sandbox_file_download_url` — Share large binary files (video, image, PDF)
+- `report_platform_issue` — Send internal feedback
+
+**Notifications & Scheduling:**
+- `notify_automation_channel` — Post to automation Slack channel (scheduled runs)
+- `schedule_thread_wakeup` — Re-trigger agent run after delay (for polling)
+
+**Reviewer-Only Tools:**
+- `add_finding`, `update_finding`, `list_findings` — Code review findings model
+- `publish_review` — Publish findings to GitHub PR
+- `fetch_review_diff` — Bounded diff for review scope
+- `reply_to_finding_thread`, `resolve_finding_thread` — Finding comment threads
+
+**Optional MCP-Backed Tools** (server-side only, not in sandbox):
+- **Datadog MCP** — `datadog_query_logs`, `datadog_get_monitor` (when `DATADOG_*_TOKEN` set and user authorized)
+- **LangSmith MCP** — `langsmith_get_trace`, `langsmith_list_runs` (read-only; for observability-authorized users)
+- **Corridor MCP** — `corridor_analyze_plan` (guardrail evaluation; when `CORRIDOR_API_TOKEN` set)
+- **Notion MCP** — Connect user's Notion for custom instructions storage
+
+**Source:** [agent/tools/](agent/tools/) directory (~50 .py files); [agent/server.py](agent/server.py) line ~50–120 for tool list.
+
+### **Tool Call Dispatch & Parsing**
+
+- **Dispatch:** Deep Agents' `create_deep_agent()` wires tools; LangGraph agent loop dispatches based on tool_calls in LLM output
+- **Tool error handling:** `ToolErrorMiddleware` ([agent/middleware/tool_error_handler.py](agent/middleware/tool_error_handler.py)) catches exceptions, wraps as ToolMessage, and continues
+- **Tool input sanitization:** `SanitizeToolInputsMiddleware` ([agent/middleware/sanitize_tool_inputs.py](agent/middleware/sanitize_tool_inputs.py)) normalizes inputs before dispatch
+
+### **Sandboxing & Permission Model**
+
+- **File operations isolated to sandbox root** — No host escape; `read_file`/`write_file`/`delete` restricted by path
+- **GitHub auth via proxy** — Agent runs `gh` without real token; LangSmith sandbox proxy injects Basic (git) or Bearer (API) auth
+- **Network isolation** — Sandbox has controlled egress; no credential leakage
+- **Approval flows:**
+  - **Plan mode:** User must call `approve_plan` before code changes executed
+  - **PR drafts:** PRs opened as draft; user must manually mark ready-for-review
+  - **Structured message queue:** Follow-up messages injected via `check_message_queue_before_model` middleware
+
+**Source:** [agent/tools/](agent/tools/), [agent/integrations/langsmith.py](agent/integrations/langsmith.py) for GitHub proxy, [agent/middleware/](agent/middleware/) for sandboxing.
+
+---
+
+## **8. Prompt & System Message Strategy**
+
+### **System Prompt Assembly**
+
+Three-layer composition in [agent/prompt.py](agent/prompt.py):
+
+1. **Shared base** (`OPEN_SWE_SHARED_BASE` line ~120): Core behavior rules, concise style directive, tool call discipline ("MUST call a tool EVERY TURN"), instruction hierarchy
+2. **Source guidance** (`replace_source_guidance` line ~340): Slack-specific (thread replies, reactions, message options), Linear (issue comments), GitHub (PR comments), Dashboard (web UI), Schedule (no interaction)
+3. **Repository scope** (`_render_repository_scope_section` line ~420): Org-allowed repos from `ALLOWED_GITHUB_ORGS`; blocks modifications outside those orgs unless user provides full GitHub URL
+
+### **AGENTS.md Injection**
+
+- **Per-repo override:** If repo root contains `AGENTS.md`, it's read during webhook processing and injected into system prompt
+- **Scope:** Repo-level rules (testing requirements, naming conventions, architectural constraints)
+- **Middleware:** `SubdirAgentsReadMiddleware` appends ancestor `AGENTS.md` instructions once per run before first edit tool call
+
+**Source:** [agent/prompt.py](agent/prompt.py) lines 120–450; [AGENTS.md](AGENTS.md) "Context Engineering" section.
+
+### **Prompt Caching & Context Management**
+
+- **Thread-level settings** snapshot at first run; persisted in thread metadata to avoid stale overrides as users change dashboard profile
+- **Dynamic context injection** via `DynamicContextMiddleware` — pulls repo metadata, user identity, channel topic on-demand
+- **Prompt cache (OpenAI):** Not explicitly cached by Open SWE; delegated to provider's native caching if supported
+
+### **Few-Shot Examples**
+
+- **Plan-mode example HTML** embedded in prompt ([agent/prompt.py](agent/prompt.py) "Plan Mode Guidance" section) with design guidance (colors, typography, layout, light/dark theme)
+- **Middleware examples:** Example tool calls shown in system prompt for complex workflows (plan mode, message queue injection)
+
+---
+
+## **9. Memory & Context Management**
+
+### **Short-Term (Working Memory)**
+
+- **Agent state:** Standard LangChain message list in graph state
+- **Per-turn checkpoint:** Stored in LangGraph checkpointer (TTL 12 hours by default, [langgraph.json](langgraph.json) line ~16)
+- **Sandbox worktree:** All files edited/created live in sandbox; agent reads/modifies them across turns
+- **Turn diffs:** `refs/open-swe/turns/<user-message-id>` git refs record worktree state at run start for dashboard changed-files view ([agent/utils/turn_checkpoint.py](agent/utils/turn_checkpoint.py))
+
+### **Long-Term (Persistent Storage)**
+
+- **LangGraph store:** Persists thread metadata (thread_id → model, repo, owner, sandbox_id, timestamps)
+- **LangSmith:** Trace logs and run history (if `LANGSMITH_API_KEY` set)
+- **Dashboard database:** User profiles, repo access, enabled repos, team settings (exact DB technology not specified; likely PostgreSQL in deployment)
+- **Review findings:** Stored in LangGraph store under namespace `["review_findings", pr_key]` ([agent/review/findings.py](agent/review/findings.py))
+
+### **Context Truncation & Summarization**
+
+- **Model call recursion limit:** `DEFAULT_RECURSION_LIMIT = 9_999` ([agent/runtime/constants.py](agent/runtime/constants.py) line 4); actual agent limit capped at `MODEL_CALL_RECURSION_LIMIT = 5_000`
+- **Message queue injection:** Recent messages (Linear comments, Slack replies) injected before each model call via `check_message_queue_before_model` to keep history fresh
+- **No automatic summarization:** Agent responsible for keeping own context; relies on model's context window and LLM's ability to compress history
+- **Offloading large results:** Tool outputs that exceed inline limits are written to sandbox and referenced by path ([agent/tools/_sandbox_output.py](agent/tools/_sandbox_output.py))
+
+### **Sandbox Persistence Strategy**
+
+- **One sandbox per thread, persistent across turns** — Reused/reconnected on each invocation
+- **Reconnection logic:** [agent/utils/sandbox_state.py](agent/utils/sandbox_state.py) `ensure_sandbox_for_thread` handles three cases:
+  1. Cached in memory → ping (`echo ok`)
+  2. Metadata has ID but not cached → reconnect
+  3. No ID → create new sandbox
+- **Sandbox as context:** All uncommitted code edits, git branches, temporary files preserved per thread
+
+---
+
+## **10. Planning Subsystem**
+
+### **Explicit Planner Pattern**
+
+- **Opt-in:** User calls `enter_plan_mode` tool (not automatic)
+- **Plan lifecycle:**
+  1. **Research phase:** Agent reads repo in read-only mode (`read_file`, `ls`, `grep`, `web_search`)
+  2. **Planning phase:** Creates `/workspace/plans/YYYY-MM-DD-task-slug.html` with implementation plan (high-level design, no code)
+  3. **Publish:** `save_plan` publishes plan to dashboard review link
+  4. **Approval:** User reviews and calls `approve_plan` or requests changes
+  5. **Implementation:** After approval, plan mode exits and agent can edit/commit/push
+
+**Source:** [agent/prompt.py](agent/prompt.py) line ~360 "PLAN MODE" section (>150 lines of detailed guidance).
+
+### **Task Decomposition**
+
+- **Subagent delegation:** Parent agent can call `task` tool to spawn isolated child agents for parallel research, code review, or testing
+- **Child agent scope:** Separate model call limit (`MODEL_CALL_RECURSION_LIMIT`), own middleware stack, but same sandbox worktree
+- **No explicit DAG:** Decomposition is driven by agent reasoning, not a config-based plan
+
+### **Todo Lists & Checkpoints**
+
+- No built-in todo tracker; agent maintains its own state via tool calls and message history
+- **Baby-sit watches** ([agent/baby_sit.py](agent/baby_sit.py)) manage durable CI watch tasks (retry counts, settled checks, alert keys)
+
+---
+
+## **11. Sub-Agents & Delegation**
+
+### **Subagent Architecture**
+
+- **Framework:** Deep Agents' `task` tool + `SubAgent` spec
+- **Invocation:** Agent calls `task` with child description; child gets its own graph, model call limit, middleware
+- **Scope:** Each child has access to shared sandbox worktree (not a separate sandbox)
+- **Fallback:** `task_retry_on` middleware handles tool errors with bounded retries before escalating
+
+**Example SubAgent spec** (from [agent/chat.py](agent/chat.py) line ~140):
+```python
+SubAgent(
+    name="general_purpose",
+    description="Researches code and explores repositories",
+    system_prompt="You are a code researcher...",
+    tools=[...],
+    middleware=[ToolErrorMiddleware(), ...],
+)
+```
+
+**Source:** [agent/server.py](agent/server.py) lines ~110–140; [agent/chat.py](agent/chat.py) line ~140; [agent/middleware/task_retry.py](agent/middleware/task_retry.py).
+
+---
+
+## **12. Human-In-The-Loop**
+
+### **Approval Prompts**
+
+- **Plan approval:** `approve_plan` required before implementation; user reviews HTML plan in dashboard
+- **PR draft workflow:** PRs opened as draft; user manually marks ready-for-review to trigger CI and merge
+- **Interactive message queue:** Follow-up Slack/Linear messages injected via `check_message_queue_before_model` before each model call — agent picks them up mid-run
+
+### **Interrupts & Resumption**
+
+- **Multitask strategy:** `"interrupt"` by default ([agent/dispatch.py](agent/dispatch.py) line ~50) — new message halts active run, resumes with full history
+- **Stream resumability:** Runs with `stream_resumable=True` retain event history for replay in UI
+
+### **Review UI**
+
+- **Dashboard thread view:** Shows agent's thinking, tool calls, results in real-time
+- **Plan review link:** User can approve/request changes interactively
+- **PR review findings:** Reviewer emits findings, user can dismiss or resolve them via UI threads
+
+**Source:** [agent/dispatch.py](agent/dispatch.py), [agent/prompt.py](agent/prompt.py) "Plan Mode" section, [ui/](ui/) React components.
+
+---
+
+## **13. Sandboxing & Safety**
+
+### **Sandbox Providers**
+
+Six pluggable providers (configurable via `SANDBOX_TYPE` env var):
+
+| Provider | Isolation | Speed | Cold Start | Notes |
+|---|---|---|---|---|
+| **LangSmith** (default) | Cloud VM | Fast | ~30s–1m | Persistent, GitHub proxy built-in |
+| **Modal** | Serverless container | Fast | <10s | Pre-warmed; stateless |
+| **Daytona** | Cloud container | Medium | ~30s | Dev-friendly; open-source |
+| **Runloop** | Cloud sandbox | Medium | ~20s | Optimized for agent tasks |
+| **E2B** | Cloud sandbox | Medium | ~10–30s | JavaScript/Python support |
+| **Local** | Host shell | Instant | 0s | Dev only; no isolation (warning) |
+
+**Default:** LangSmith; configured via `DEFAULT_SANDBOX_SNAPSHOT_ID` UUID.
+
+**Source:** [agent/utils/sandbox.py](agent/utils/sandbox.py) line ~40; [agent/integrations/](agent/integrations/) provider files; [docs/CUSTOMIZATION.md](docs/CUSTOMIZATION.md) line ~60.
+
+### **GitHub Proxy**
+
+- **Mechanism:** LangSmith sandbox proxy intercepts git and API traffic to `github.com` and `api.github.com`
+- **Auth injection:** Basic auth (git operations) and Bearer auth (API/`gh` CLI) injected from GitHub App installation token, minted at runtime
+- **No token in sandbox:** Agent runs plain `gh <command>` without storing credentials
+- **Auto-refresh:** `refresh_github_proxy_before_model` middleware refreshes proxy token before each model call
+
+**Source:** [agent/integrations/langsmith.py](agent/integrations/langsmith.py) `_configure_github_proxy`; [agent/middleware/refresh_github_proxy.py](agent/middleware/refresh_github_proxy.py).
+
+### **Filesystem Jails**
+
+- **Root restriction:** Sandbox root defined per provider; all file operations confined to root
+- **Deep Agents FilesystemBackend:** Validates paths; blocks `..` escapes and absolute paths outside root
+- **Sandbox backend protocol:** All file ops routed through backend's `read_file`, `write_file`, `execute` methods (no raw OS access from agent)
+
+### **Network Policies**
+
+- **Egress:** Sandbox can call GitHub API (proxied), fetch URLs, call LLMs, post to Slack/Linear
+- **Ingress:** No inbound listening; webhooks land on fastapi server, not in sandbox
+- **Secrets:** No credentials stored in sandbox; injected via proxy or env-var at runtime
+
+### **Secret Handling**
+
+- **User GitHub tokens:** Stored encrypted at rest in dashboard database; decrypted only when needed for OAuth operations or PR attribution
+- **GitHub App credentials:** Only in deployment environment; never in sandbox
+- **Observability keys** (Datadog, LangSmith, Corridor): Kept in LangGraph server process; never sent to sandbox
+- **Encryption:** `cryptography` library ([pyproject.toml](pyproject.toml) line 11) used for at-rest encryption
+
+**Source:** [agent/encryption.py](agent/encryption.py), [agent/utils/auth.py](agent/utils/auth.py), [docs/CUSTOMIZATION.md](docs/CUSTOMIZATION.md) "Sandboxing" section.
+
+---
+
+## **14. Observability**
+
+### **Tracing**
+
+- **LangSmith integration:** Full trace logging to LangSmith platform
+- **Trace project names:** `AGENT_TRACING_PROJECT` (main agent), `REVIEW_TRACING_PROJECT` (reviewer) from [agent/utils/tracing.py](agent/utils/tracing.py)
+- **Trace context:** Includes thread_id, repo, model, run cost, sandbox info
+- **Graph factory wrapper:** `traced_graph_factory` ([agent/utils/tracing.py](agent/utils/tracing.py)) adds LangSmith instrumentation to every graph
+
+### **Logging**
+
+- **Module loggers:** Standard Python `logging` module; each file has `logger = logging.getLogger(__name__)`
+- **Log levels:** Debug (verbose), Info (events), Warning (recovery), Error/Exception (failures)
+- **Startup trace phases:** [agent/utils/startup_trace.py](agent/utils/startup_trace.py) tracks graph factory timing (dev debugging)
+
+### **Token Counting & Cost Tracking**
+
+- **Token counting:** Delegated to provider (OpenAI, Anthropic, etc.); no manual counting
+- **Cost tracking:** [agent/session_cost.py](agent/session_cost.py) and [agent/utils/run_usage.py](agent/utils/run_usage.py) calculate estimated costs per run
+- **Usage recording:** `record_agent_run_usage` in [agent/dashboard/agent_usage.py](agent/dashboard/agent_usage.py) logs usage to dashboard DB
+
+### **Optional Integration: Datadog**
+
+- **MCP server:** Datadog's hosted MCP server provides `datadog_query_logs`, `datadog_get_monitor`
+- **Auth:** Tokens managed by admins in team settings; never exposed to sandbox
+- **Gating:** Only available to observability-authorized users (`OBSERVABILITY_AUTHORIZED_EMAILS`)
+
+**Source:** [agent/integrations/datadog_mcp.py](agent/integrations/datadog_mcp.py).
+
+---
+
+## **15. Evaluation & Testing**
+
+### **Eval Suites**
+
+- **Reviewer evals** in [evals/reviewer/](evals/reviewer/) — benchmarks for code review correctness and finding detection
+- **Agent evals** — integration tests for Slack, Linear, GitHub triggers
+
+### **Unit Tests**
+
+Comprehensive test suite in [tests/](tests/) with fixtures:
+
+- **Agent tests** ([tests/agent/](tests/agent/)) — Graph construction, thread settings, agent instructions, scheduling, plan mode, skill loading
+- **Tool tests** ([tests/tools/](tests/tools/)) — Individual tool functionality
+- **Middleware tests** ([tests/middleware/](tests/middleware/)) — Middleware ordering, message injection, error handling
+- **Webhook tests** ([tests/webhooks/](tests/webhooks/)) — Slack, Linear, GitHub webhook parsing and dispatch
+- **Sandbox tests** ([tests/sandbox/](tests/sandbox/)) — Provider integrations (Modal, E2B, Daytona, Runloop)
+- **Dashboard tests** ([tests/dashboard/](tests/dashboard/)) — OAuth, profiles, repo access, settings
+
+### **E2E Tests**
+
+- [tests/e2e/](tests/e2e/) — Playwright-based tests for web UI and desktop app
+- Commands: `pnpm test:e2e`, `pnpm test:e2e:desktop`
+
+### **CI Enforcement**
+
+- Linting: `make lint` (ruff check)
+- Formatting: `make format` (ruff format)
+- Type checking: `make typecheck` (basedpyright)
+- Unit tests: `make test` (pytest all tests)
+
+**Source:** [tests/](tests/) directory, [Makefile](Makefile).
+
+---
+
+## **16. Configuration**
+
+### **Environment Variables**
+
+**LLM & Gateway:**
+- `LLM_MODEL_ID` — Primary model (default: value from dashboard)
+- `LANGSMITH_GATEWAY_ENABLED` — Route models through LangSmith LLM Gateway
+- `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_API_BASE` — OpenAI credentials/endpoint
+- `DEFAULT_LLM_REASONING` — OpenAI reasoning config (effort, summary)
+
+**Sandbox:**
+- `SANDBOX_TYPE` — Provider: langsmith, daytona, modal, runloop, e2b, local (default: langsmith)
+- `DEFAULT_SANDBOX_SNAPSHOT_ID` — UUID of base sandbox snapshot
+- `DEFAULT_SANDBOX_VCPUS`, `DEFAULT_SANDBOX_MEM_BYTES`, `DEFAULT_SANDBOX_IDLE_TTL_SECONDS`
+- `SANDBOX_LANGSMITH_API_KEY`, `SANDBOX_LANGSMITH_ENDPOINT` — Separate workspace for sandboxes
+
+**GitHub:**
+- `ALLOWED_GITHUB_ORGS` — Comma-separated list of orgs agent can modify repos in
+- `GITHUB_OAUTH_PROVIDER_ID` — GitHub OAuth App client ID
+
+**Slack:**
+- `SLACK_BOT_TOKEN`, `SLACK_SIGNING_SECRET` — Slack app credentials
+
+**Linear:**
+- `LINEAR_API_KEY`, `LINEAR_WORKSPACE_ID` — Linear workspace credentials
+
+**Observability:**
+- `LANGSMITH_API_KEY_PROD`, `LANGSMITH_ENDPOINT`, `LANGSMITH_HOST_API_URL` — Trace backend
+- `DATADOG_API_KEY`, `DATADOG_APP_KEY` — Datadog integration
+- `CORRIDOR_API_TOKEN`, `CORRIDOR_MCP_URL` — Corridor guardrails
+- `OBSERVABILITY_AUTHORIZED_EMAILS` — Users allowed to access observability tools
+
+**Search & Research:**
+- `EXA_API_KEY` — Exa web search API
+
+**Desktop:**
+- `OPEN_SWE_LOCAL_PROJECTS_FILE` — Allowlist of local projects for desktop mode
+- `OPEN_SWE_LOCAL_ARTIFACTS_DIR` — Directory for large tool results/conversation history
+
+**Infrastructure:**
+- `LANGGRAPH_URL`, `LANGGRAPH_URL_PROD` — LangGraph server endpoint
+- `DASHBOARD_ALLOWED_ORIGINS` — CORS allowlist for dashboard
+
+**Source:** [agent/utils/auth.py](agent/utils/auth.py), [agent/utils/model.py](agent/utils/model.py), [agent/utils/sandbox.py](agent/utils/sandbox.py), [docs/CUSTOMIZATION.md](docs/CUSTOMIZATION.md).
+
+### **Configuration Files**
+
+- **langgraph.json** — Graph entrypoints, checkpointer TTL, env file path
+- **AGENTS.md** (per-repo) — Repo-specific agent instructions (read from sandbox during run)
+- **Dashboard settings** — Model defaults, enabled repos, team credentials (Web UI or API-driven)
+
+---
+
+## **17. Entry Points**
+
+### **CLI Commands**
+
+```bash
+make install            # uv sync --extra dev
+make dev                # langgraph dev (serves all graphs + FastAPI)
+make run                # uvicorn agent.webapp:app --reload
+make test               # pytest all tests
+make lint               # ruff check
+make format             # ruff format + check --fix
+make typecheck          # basedpyright
+```
+
+### **Web API (FastAPI)**
+
+Served at port 8000 by default:
+
+- **Webhooks:**
+  - `POST /webhooks/slack` — Slack message events
+  - `POST /webhooks/linear` — Linear comment events
+  - `POST /webhooks/github` — GitHub push/PR/check-run events
+
+- **Dashboard API** (`/dashboard/api/...`):
+  - `GET /threads` — List threads
+  - `POST /threads/{id}/messages` — Send message to thread
+  - `GET /settings/profile` — User profile
+  - `PUT /settings/team` — Team defaults (admin only)
+
+- **LangGraph API** (mounted from langgraph_sdk):
+  - `POST /runs` — Trigger graph execution
+  - `GET /runs/{run_id}` — Get run status
+  - `POST /threads/{thread_id}/runs` — Run on existing thread
+
+**Source:** [agent/api/app.py](agent/api/app.py), [agent/dashboard/routes.py](agent/dashboard/routes.py), [agent/webhooks/](agent/webhooks/).
+
+### **Slack**
+
+- **Mention format:** `@openswe <task>` in any thread or DM
+- **Repo syntax:** `repo:owner/name` in message to target specific repo
+- **Auto-acknowledgement:** 👀 reaction on invocation
+
+### **Linear**
+
+- **Mention format:** `@openswe` comment on any issue
+- **Workflow:** Issue comment → agent reads full context → posts updates as comments
+
+### **GitHub**
+
+- **PR comments:** Tag `@openswe` to request changes or trigger additional work
+- **Auto-review:** Enable on repo settings; agent auto-reviews opened/ready_for_review PRs
+- **Baby-sit watches:** Opt-in PR CI monitoring with auto-retry on flaky failures
+
+### **Dashboard Web UI** (React)
+
+- **URL:** `https://<deployment>/agents` (or localhost:3000 in dev)
+- **Features:** Start/continue agent chats, view runs, manage profile settings, approve plans
+
+### **Desktop App** (Electron)
+
+- **UI:** Embedded React dashboard
+- **Local execution:** Agent runs directly in project directory (no cloud sandbox)
+- **Allowlist:** Projects must be in `OPEN_SWE_LOCAL_PROJECTS_FILE` for security
+
+**Source:** [ui/](ui/), [desktop/](desktop/), [agent/webhooks/](agent/webhooks/).
+
+---
+
+## **18. Notable Idioms & Patterns**
+
+### **Deterministic Thread IDs**
+
+- **Idempotency:** Thread ID derived from invocation surface + context (Slack thread_ts, Linear issue_id, GitHub PR + user, etc.)
+- **Follow-ups route to same run:** New message with same thread ID retrieves existing thread, re-invokes with `"interrupt"` multitask strategy
+- **Source:** [agent/webhooks/common.py](agent/webhooks/common.py) line ~100 (thread_id resolution functions)
+
+### **Middleware Stack Ordering**
+
+Matters for correctness. From [agent/server.py](agent/server.py) line ~250–280:
+1. **SanitizeToolInputsMiddleware** — Normalize before tools see input
+2. **ModelCallLimitMiddleware** — Enforce recursion cap early
+3. **ToolErrorMiddleware** — Wrap exceptions before model
+4. **SubdirAgentsReadMiddleware** — Inject AGENTS.md on first edit
+5. **check_message_queue_before_model** — Inject follow-ups before next model call
+6. **ensure_no_empty_msg** — Re-inject tool call if model emits none
+7. **notify_step_limit_reached** — Notify user on recursion limit
+8. **SandboxCircuitBreakerMiddleware** — Trip on repeated sandbox failures
+9. **ModelFallbackMiddleware** — Retry with fallback model on provider error
+10. **SanitizeThinkingBlocksMiddleware** — Fix malformed Anthropic thinking
+11. **ModelCallTimeoutMiddleware** (innermost) — Cap single model call at 15 min
+
+### **Sandbox State Machine**
+
+[agent/utils/sandbox_state.py](agent/utils/sandbox_state.py) `SandboxBackendProxy` maintains:
+- **Backend handle:** Current sandbox instance or None
+- **Reconnect callback:** Async function to create/reconnect sandbox
+- **Startup task:** Async task for concurrent reconnection
+- **Lock:** Serialize concurrent reconnect attempts
+
+Key insight: **Never replace sandbox on error** — replacement is empty, discarding uncommitted work. Instead, raise `SandboxUnreachableError` and notify user.
+
+### **Prompt Fingerprinting**
+
+[agent/middleware/prepare_run.py](agent/middleware/prepare_run.py) `_latest_message_fingerprint`:
+- Hashes latest message (ID + content + type) to detect when to re-prepare (new invocation vs. resume)
+- Prevents re-running setup on resumed runs; enables re-run setup on new invocations
+
+### **Turn Checkpointing**
+
+[agent/utils/turn_checkpoint.py](agent/utils/turn_checkpoint.py):
+- Records git refs at run start: `refs/open-swe/turns/<user-message-id>`
+- Dashboard reads these refs to compute changed files without replaying edit tool calls (catches edits made via raw `execute` commands)
+
+### **Tool Metadata Preservation**
+
+- **Tool attribution:** PR attributed to user's GitHub account if token available; otherwise bot token
+- **Message attribution:** Slack replies stamped with thread metadata (triggering_user_id, triggering_user_name, channel_id)
+
+**Source:** [agent/tools/open_pull_request.py](agent/tools/open_pull_request.py) line ~50, [agent/tools/slack_thread_reply.py](agent/tools/slack_thread_reply.py) line ~50.
+
+---
+
+## **19. Data Flow Diagram (Textual)**
+
+### **Slack-Triggered Execution**
+
+```
+User types: "@openswe fix authentication bug in <repo:owner/name>"
+                                           ↓
+                    Slack sends message_events webhook
+                                           ↓
+                   FastAPI: POST /webhooks/slack
+                   (agent/webhooks/slack_routes.py)
+                                           ↓
+              Parse event, extract thread_ts, channel_id
+              Map Slack user ID → GitHub login (via dashboard DB)
+              Resolve default repo if not in message
+                                           ↓
+                   Deterministic thread_id from (channel_ts)
+                   Check if thread exists in LangGraph
+                                           ↓
+           dispatch_agent_run(thread_id, RunInput, config)
+           (agent/dispatch.py:_dispatch_input)
+                                           ↓
+        LangGraph SDK: langgraph_client.runs.create(
+            graph_id="agent",
+            thread_id=thread_id,
+            input=RunInput,
+            configurable={...},
+            multitask_strategy="interrupt",  # New messages halt active run
+            stream_resumable=True,           # Dashboard can replay events
+            webhook=COMPLETION_WEBHOOK_URL,  # Called on finish
+        )
+                                           ↓
+            LangGraph API: get_agent(config) factory called
+            (agent/server.py:get_agent)
+                                           ↓
+      Resolve GitHub token for user (OAuth store)
+      get_or_create_sandbox(thread_id)
+      Resolve model & system prompt + AGENTS.md
+      Create Deep Agent with tools + middleware stack
+                                           ↓
+        Agent loop starts: model.invoke(messages + system_prompt)
+                                           ↓
+         LLM responds with tool_calls (e.g., ["execute", "slack_thread_reply"])
+         Tool dispatch (via Deep Agents)
+                                           ↓
+            Tool implementations (agent/tools/*.py)
+            - execute: Sandbox shell command
+            - slack_thread_reply: Post to Slack via API
+            - read_file, write_file, etc.: Sandbox file ops
+                                           ↓
+             Return tool results as ToolMessages
+             Middleware intercepts (ToolErrorMiddleware, etc.)
+                                           ↓
+          Agent loop: Check message queue, inject follow-ups
+          Model again with history + tool results
+                                           ↓
+           [Repeat until model requests no tools or recursion limit hit]
+                                           ↓
+         LangGraph checkpoints final state, emits completion event
+         Webhook notifies FastAPI (COMPLETION_WEBHOOK_URL)
+                                           ↓
+        Dashboard UI: stream_resumable allows replaying all events
+        Slack receives final reply (if slack_thread_reply was called)
+```
+
+### **GitHub PR Auto-Review Flow**
+
+```
+User opens PR on enabled repo
+                ↓
+GitHub webhook: POST /webhooks/github (pull_request.opened)
+                ↓
+Parse PR metadata (owner, repo, PR #, head SHA)
+Verify repo is in enabled list + author opted-in
+                ↓
+Generate thread_id from PR (one per PR, stable)
+                ↓
+dispatch_agent_run(
+    graph_id="reviewer",
+    thread_id=pr_thread_id,
+    configurable={pr_number, owner, repo, ...}
+)
+                ↓
+Reviewer graph factory (agent/reviewer.py:get_reviewer_agent)
+                ↓
+Prepare sandbox: deterministic checkout of PR head
+Compute unified diff + line ranges
+Load review findings schema + guidelines
+                ↓
+Reviewer Deep Agent with read-only tools:
+  - fetch_review_diff (bounded to PR diff)
+  - add_finding, update_finding, list_findings
+  - publish_review (final step)
+  - web_search, fetch_url (read-only research)
+                ↓
+Model examines diff, emits findings
+  (Middleware: RepairOrphanedToolCalls, DynamicContext)
+                ↓
+Calls publish_review to post GitHub review
+                ↓
+For each finding thread in GitHub, reconcile with historical threads
+                ↓
+Set GitHub check run status (COMPLETED / REQUESTED_CHANGES / COMMENTED)
+                ↓
+(Async) analyzer cron runs nightly:
+  dispatch_agent_run(graph_id="analyzer", mode="continual")
+  Reads this reviewer's own finding outcomes (resolved/dismissed)
+  Refines per-repo review style prompt via save_review_style_prompt
+```
+
+---
+
+## **20. Weaknesses & Gaps**
+
+### **Known Limitations**
+
+1. **No automatic task decomposition:** Agent must decide when to spawn subagents; no planner auto-breaks large tasks into independent subtasks.
+
+2. **Context window management:** No built-in summarization strategy; relies on LLM's native compression and pragmatic history truncation at `DEFAULT_RECURSION_LIMIT`.
+
+3. **Limited persistent memory:** No long-term vector DB or semantic cache for learned context across threads. Per-thread metadata is minimal (model, repo, effort).
+
+4. **Hardcoded tool curated list:** Adding a new tool requires code changes + re-deploy. No dynamic tool loading from config files (unlike some frameworks).
+
+5. **Sandbox snapshot updates:** Changing the base sandbox snapshot (`DEFAULT_SANDBOX_SNAPSHOT_ID`) requires coordinating with deployed instances; no hot-reload of pre-warmed snapshots.
+
+6. **No cross-thread memory/learning:** Each thread is isolated. Agent doesn't learn patterns or build up knowledge from previous runs on same repo.
+
+7. **Plan mode HTML validation:** No automated linting/validation of generated plan HTML; relies on agent following design guidelines.
+
+8. **Linear integration limited:** No deep Linear project/team hierarchy support; mostly issue-comment-centric.
+
+9. **Desktop mode allowlist:** Requires manual `OPEN_SWE_LOCAL_PROJECTS_FILE` configuration; no UI for users to add projects.
+
+10. **Streaming latency:** Dashboard UI depends on stream_resumable events; network delays can make real-time feedback lag.
+
+11. **Reviewer reconciliation:** Complex logic ([agent/review/reconcile.py](agent/review/reconcile.py)) to match historical review threads with new findings; edge cases possible.
+
+12. **No built-in cost limits:** Framework tracks costs but has no hard spending cap; orgs must monitor via usage dashboard.
+
+13. **Middleware coupling:** Tight interdependencies between middleware components; refactoring is risky (e.g., `check_message_queue_before_model` must run before model call, but after all prior middleware).
+
+14. **GitHub Org boundary enforcement:** Relies on parsing `ALLOWED_GITHUB_ORGS` string; no dynamic org membership queries at runtime (only at user-mapping resolution).
+
+15. **No offline mode:** All external integrations (Slack, Linear, GitHub, LLM providers) are cloud-dependent; no graceful offline fallback.
+
+---
+
+## **Summary: Key Architectural Decisions**
+
+| Decision | Rationale | Impact |
+|---|---|---|
+| **Composed on Deep Agents + LangGraph** | Upgrade path; don't fork OpenCode/Goose | Easier to pull upstream improvements |
+| **One persistent sandbox per thread** | Preserves uncommitted work; simpler UX | State persists across turns; requires careful reconnection logic |
+| **Curated small tool list (~25)** | Quality over quantity; less confusion | Less flexibility; fewer built-in tools than competitors |
+| **Middleware stack ordering** | Fine-grained control over execution | Fragile; reordering breaks things; hard to extend |
+| **Plan mode as workflow** | User review before code changes | Slower; more interaction; safer |
+| **Deterministic thread IDs** | Idempotent follow-ups | Slightly complex ID derivation per-surface |
+| **GitHub proxy for sandbox auth** | No credentials in sandbox; less risk | Extra hop; potential latency |
+| **Reviewer as separate graph** | Read-only specialized agent | Parallel to main agent; adds complexity |
+| **LangGraph store for state** | Built-in persistence + checkpointing | Tight coupling to LangGraph; not portable |
+
+---
+
+**End of Report**
+
+This analysis covers all 20 requested dimensions with concrete file paths and line number references throughout. Open SWE is a well-engineered, production-grade agent framework emphasizing safety, composability, and enterprise integrations (Slack, Linear, GitHub) with optional observability (LangSmith, Datadog, Corridor).
