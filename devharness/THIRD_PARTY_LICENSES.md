@@ -18,9 +18,8 @@ obligations of both the upstream projects listed below, since:
 
 | Upstream project | License | Files ported into devharness | Attribution |
 |---|---|---|---|
-| [Visa Vulnerability Agentic Harness](https://github.com/visa/visa-vulnerability-agentic-harness) | Apache 2.0 | 5 files (see [§1](#1-visa-vulnerability-agentic-harness-vvaharness)) | NOTICE forwarded per § 4(d) |
-| [Hermes Agent](https://github.com/NousResearch/hermes-agent) | MIT | 8 files (see [§2](#2-hermes-agent)) | Copyright + permission notice below |
-
+| [Visa Vulnerability Agentic Harness](https://github.com/visa/visa-vulnerability-agentic-harness) | Apache 2.0 | 6 files (see [§1](#1-visa-vulnerability-agentic-harness-vvaharness)) | NOTICE forwarded per § 4(d) |
+| [Hermes Agent](https://github.com/NousResearch/hermes-agent) | MIT | 8 files (see [§2](#2-hermes-agent)) | Copyright + permission notice below || [DeepAgents](https://github.com/langchain-ai/deepagents) | MIT | 1 file (see [§3](#3-deepagents)) | Copyright + permission notice below |
 ---
 
 ## 1. Visa Vulnerability Agentic Harness (vvaharness)
@@ -43,6 +42,7 @@ The upstream `NOTICE` file is reproduced verbatim in the top-level
 | Adapted file in devharness | Upstream source |
 |---|---|
 | `devharness/sandbox/_jail.py` | `vvaharness/backends/localtools.py` |
+| `devharness/providers/anthropic.py` (partial) | `vvaharness/backends/sdk.py` |
 | `devharness/session/store.py` | `vvaharness/orchestrator/store.py` |
 | `devharness/config/__init__.py` | `vvaharness/config/__init__.py` |
 | `devharness/redaction/rules.py` | `vvaharness/report/redact.py` |
@@ -107,6 +107,52 @@ are documented inline in each file's module docstring and in
 
 ---
 
+## 3. DeepAgents
+
+- **Upstream:** <https://github.com/langchain-ai/deepagents>
+- **Upstream commit at time of port:** `23b83ad50f63d241d0069a3dc426d43b211adf2e`
+- **License:** MIT License — Copyright (c) LangChain, Inc.
+
+### Required MIT notice
+
+MIT requires that "the above copyright notice and this permission notice shall
+be included in all copies or substantial portions of the Software." The full
+notice, reproduced verbatim from the upstream `LICENSE`, is:
+
+> MIT License
+>
+> Copyright (c) LangChain, Inc.
+>
+> Permission is hereby granted, free of charge, to any person obtaining a copy
+> of this software and associated documentation files (the "Software"), to
+> deal in the Software without restriction, including without limitation the
+> rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+> sell copies of the Software, and to permit persons to whom the Software is
+> furnished to do so, subject to the following conditions:
+>
+> The above copyright notice and this permission notice shall be included in
+> all copies or substantial portions of the Software.
+>
+> THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+> IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+> FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+> AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+> LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+> FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+> DEALINGS IN THE SOFTWARE.
+
+### Ported files
+
+| Adapted file in devharness | Upstream source |
+|---|---|
+| `devharness/loop/steps/compaction.py` | `libs/deepagents/deepagents/middleware/summarization.py` (extract-pattern) |
+
+Each ported file was selectively adapted (not copied verbatim); adaptations
+are documented inline in each file's module docstring and in
+[`scripts/LIFT_MANIFEST.toml`](scripts/LIFT_MANIFEST.toml).
+
+---
+
 ## Design references (no code lifted)
 
 The following upstream projects informed the design of devharness but no code
@@ -117,7 +163,7 @@ obligations arise from a pure design lift.
 |---|---|---|---|
 | OpenAI Codex | Apache 2.0 | <https://github.com/openai/codex> | V4A patch grammar; per-OS sandbox layout (Landlock+bwrap / Seatbelt / RestrictedToken) |
 | Block Goose | Apache 2.0 | <https://github.com/block/goose> | Explicit `Step[]` state-machine loop engine |
-| LangChain DeepAgents | MIT | <https://github.com/langchain-ai/deepagents> | Middleware composition; summarization pattern; SubAgent TypedDict shape |
+| LangChain DeepAgents | MIT | <https://github.com/langchain-ai/deepagents> | Middleware composition; SubAgent TypedDict shape (the summarization pattern is a code lift; see [§3](#3-deepagents)) |
 | LangChain Open SWE | MIT | <https://github.com/langchain-ai/open-swe> | Deterministic thread-id-from-invocation-surface pattern |
 | Bedrock Engineer | MIT-0 | <https://github.com/aws-samples/bedrock-engineer> | PLAN/ACT dual-mode prompt UX; TUI patterns |
 

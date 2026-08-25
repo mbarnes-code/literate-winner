@@ -211,6 +211,131 @@ adaptations   = [
 # -----------------------------------------------------------------------------
 
 [[lifts]]
+dest          = "devharness/providers/anthropic.py"
+source_repo   = "visa/visa-vulnerability-agentic-harness"
+source_path   = "vvaharness/backends/sdk.py"
+source_commit = "3d972f679d8f5e3838b394edee0b5ea9c626b0fb"
+license       = "Apache-2.0"
+strategy      = "adapt"
+source_loc    = 660
+dest_loc      = 200
+adaptations   = [
+  "Ported _with_cache_marker → _apply_ephemeral_marker (strip all cache_control markers, place one on last block) to keep Anthropic's 4-block cap satisfied",
+  "System prompt block reuses VVAH's ephemeral-cache pattern (prompt() body, lines 259-266)",
+  "Reshaped as a spec §4.3 Provider (stream/supports_prompt_cache/supports_reasoning/price_per_1k) instead of VVAH's prompt()/agentic() functions",
+  "Dropped VVAH TLS/mTLS knobs, _NO_TEMP/_NO_THINK model quirks, redact() coupling, retry loop (loop layer owns retries via FallbackProvider)",
+  "Streaming loop yields devharness StreamEvent shape rather than VVAH's get_final_message() blocking assemble",
+  "Also design-consulted hermes-agent/agent/transports/anthropic.py (MIT, commit f293e7206b4ddd66042329442c6afebc19a8808d) for (system, messages) split shape — no code copied",
+]
+
+[[lifts]]
+dest          = "devharness/providers/prompt_cache.py"
+source_repo   = "langchain-ai/deepagents"
+source_path   = "libs/deepagents/deepagents/middleware/_prompt_caching.py"
+source_commit = "23b83ad50f63d241d0069a3dc426d43b211adf2e"
+license       = "MIT"
+strategy      = "design"
+source_loc    = 49
+dest_loc      = 130
+adaptations   = [
+  "Design-only lift: no code copied. Reimplemented per-provider attach-hook composition pattern without LangChain / AgentMiddleware dependency",
+  "DeepAgents' unsupported_model_behavior='ignore' posture preserved: unknown providers return the request unchanged",
+  "Per-provider handlers registered via decorator; devharness Request dataclass replaces LangChain state kwargs",
+  "Anthropic marker walker single-sourced in devharness/providers/anthropic.py so 4-block cap logic isn't duplicated here",
+]
+
+[[lifts]]
+dest          = "devharness/providers/openai.py"
+source_repo   = "NousResearch/hermes-agent"
+source_path   = "agent/transports/chat_completions.py"
+source_commit = "f293e7206b4ddd66042329442c6afebc19a8808d"
+license       = "MIT"
+strategy      = "design"
+source_loc    = 1042
+dest_loc      = 138
+adaptations   = [
+  "No code copied — interface conforms to spec §4.3. Upstream is a ProviderTransport (format conversion only), not a Provider",
+  "Consulted for tool_call streaming shape (function.name/arguments split) and stream_options={include_usage: True} pattern",
+  "Streaming loop over openai SDK ChatCompletionChunk yields devharness StreamEvent tagged-union events",
+]
+
+[[lifts]]
+dest          = "devharness/providers/openai_responses.py"
+source_repo   = "NousResearch/hermes-agent"
+source_path   = "agent/transports/chat_completions.py"
+source_commit = "f293e7206b4ddd66042329442c6afebc19a8808d"
+license       = "MIT"
+strategy      = "design"
+source_loc    = 1042
+dest_loc      = 143
+adaptations   = [
+  "No code copied — interface conforms to spec §4.3. Hermes ships no dedicated Responses transport at this commit",
+  "Consulted for the Chat-Completions ↔ Responses field split (top-level instructions, input instead of messages)",
+  "Responses events parsed by wire type (response.output_text.delta, response.function_call_arguments.delta, response.completed)",
+]
+
+[[lifts]]
+dest          = "devharness/providers/bedrock.py"
+source_repo   = "NousResearch/hermes-agent"
+source_path   = "agent/transports/bedrock.py"
+source_commit = "f293e7206b4ddd66042329442c6afebc19a8808d"
+license       = "MIT"
+strategy      = "design"
+source_loc    = 154
+dest_loc      = 135
+adaptations   = [
+  "No code copied — interface conforms to spec §4.3. Upstream is a ProviderTransport that delegates to a separate bedrock_adapter module",
+  "Consulted for Converse message shape (system as top-level blocks, content as typed-block list, toolConfig wrapper)",
+  "converse_stream() event walk parses contentBlockStart/Delta, messageStop, metadata.usage inline",
+]
+
+[[lifts]]
+dest          = "devharness/providers/google_genai.py"
+source_repo   = "NousResearch/hermes-agent"
+source_path   = "agent/transports/chat_completions.py"
+source_commit = "f293e7206b4ddd66042329442c6afebc19a8808d"
+license       = "MIT"
+strategy      = "design"
+source_loc    = 1042
+dest_loc      = 133
+adaptations   = [
+  "No code copied — interface conforms to spec §4.3. Hermes routes Gemini through chat_completions transport, not a dedicated file",
+  "Consulted for thinkingConfig translation stance (Hermes-style effort → Gemini includeThoughts) — devharness leaves that to the loop's ReasoningConfig, not the provider",
+  "Uses google-genai SDK's generate_content_stream; system peeled off messages into system_instruction",
+]
+
+[[lifts]]
+dest          = "devharness/providers/ollama.py"
+source_repo   = "NousResearch/hermes-agent"
+source_path   = "agent/transports/chat_completions.py"
+source_commit = "f293e7206b4ddd66042329442c6afebc19a8808d"
+license       = "MIT"
+strategy      = "design"
+source_loc    = 1042
+dest_loc      = 108
+adaptations   = [
+  "No code copied — interface conforms to spec §4.3. Hermes has no dedicated Ollama transport; it routes Ollama through the generic chat_completions transport",
+  "Uses ollama Python SDK client.chat(stream=True); options dict carries seed/temperature/top_p/num_predict/stop",
+  "Usage synthesized from Ollama's final done chunk (prompt_eval_count + eval_count) — no cache_read/cache_write",
+]
+
+[[lifts]]
+dest          = "devharness/providers/fallback.py"
+strategy      = "spec-only"
+source_loc    = 0
+dest_loc      = 132
+adaptations   = [
+  "No upstream code — implemented from spec §4.3 fallback semantics",
+  "429: wait Retry-After (bounded at 60s), retry same provider once, then rotate",
+  "5xx / connection error: rotate immediately",
+  "Mid-stream failures rotate only when NO text_delta/tool_call_delta has yet been forwarded downstream",
+]
+
+# -----------------------------------------------------------------------------
+# Combined lifts (single dest file, multiple sources)
+# -----------------------------------------------------------------------------
+
+[[lifts]]
 dest          = "devharness/observability/cost.py"
 strategy      = "combine"
 combined_from = [
@@ -228,12 +353,50 @@ adaptations   = [
 ]
 
 # -----------------------------------------------------------------------------
+# DeepAgents — MIT
+# -----------------------------------------------------------------------------
+
+[[lifts]]
+dest          = "devharness/loop/steps/compaction.py"
+source_repo   = "langchain-ai/deepagents"
+source_path   = "libs/deepagents/deepagents/middleware/summarization.py"
+source_commit = "23b83ad50f63d241d0069a3dc426d43b211adf2e"
+license       = "MIT"
+strategy      = "extract-pattern"
+source_loc    = 900
+dest_loc      = 155
+adaptations   = [
+  "Trigger + keep-N + summary persistence pattern extracted; no LangChain, langgraph, or langchain_core imports",
+  "Summary persisted to ~/.devharness/sessions/{session_id}/summaries/{turn_id}.md per spec §4.8 (DeepAgents writes to /conversation_history/{session_id}.md via a Backend)",
+  "Anti-thrash cooldown (spec §4.8) enforced in-process via _last_compact_at rather than DeepAgents' state-machine gating",
+  "Approximate token counting is chars/4 by default; caller can inject a real tokenizer via token_counter",
+  "Dropped media-offloading (_MEDIA_REFERENCE_SUMMARY_PROMPT, data-URL decoding, base64 branches) — devharness tool results are text and oversized results are handled by ResultSpillover",
+  "Dropped TruncateArgsSettings and its lower-threshold pre-summarization args-trim pass",
+]
+
+[[lifts]]
+dest          = "devharness/loop/steps/prompt_builder.py"
+source_repo   = "visa/visa-vulnerability-agentic-harness"
+source_path   = "vvaharness/util/prompts.py"
+source_commit = "3d972f679d8f5e3838b394edee0b5ea9c626b0fb"
+license       = "Apache-2.0"
+strategy      = "extract-pattern"
+source_loc    = 213
+dest_loc      = 90
+adaptations   = [
+  "Pattern only: shared prompt-blocks composed by a builder; no vvaharness prompt text is reused",
+  "Rendering is Jinja2 over three template files (prompts/system_{stable,context,volatile}.jinja2) — vvaharness inlines string constants",
+  "Tier-1 output SHA-256'd and pinned on ctx.prompt_hash_tier1; drift raises RuntimeError per spec §4.10",
+  "Emits one AppendMessage(role=system, ...) combining all three tiers per spec §4.10",
+]
+
+# -----------------------------------------------------------------------------
 # Design references — NO code lifted; recorded here for CI cross-check only
 # -----------------------------------------------------------------------------
 
 [design_references]
 codex           = { license = "Apache-2.0", upstream = "https://github.com/openai/codex",           reference = "codex-rs/apply-patch/ V4A grammar; codex-rs/linux-sandbox/ Landlock+bwrap pattern" }
 goose           = { license = "Apache-2.0", upstream = "https://github.com/block/goose",             reference = "goose-agent/machine.rs Step[] state-machine engine" }
-deepagents      = { license = "MIT",        upstream = "https://github.com/langchain-ai/deepagents", reference = "middleware composition; summarization pattern; SubAgent TypedDict shape" }
+deepagents      = { license = "MIT",        upstream = "https://github.com/langchain-ai/deepagents", reference = "middleware composition; SubAgent TypedDict shape (summarization pattern now a code lift; see devharness/loop/steps/compaction.py)" }
 open-swe        = { license = "MIT",        upstream = "https://github.com/langchain-ai/open-swe",   reference = "deterministic thread-id-from-invocation-surface pattern" }
 bedrock-engineer = { license = "MIT-0",     upstream = "https://github.com/aws-samples/bedrock-engineer", reference = "PLAN/ACT dual-mode UX; TUI patterns" }

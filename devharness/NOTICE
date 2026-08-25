@@ -41,6 +41,7 @@ The following upstream NOTICE is forwarded verbatim, per Apache 2.0 section 4(d)
 
 Adapted files incorporated into devharness:
   - vvaharness/backends/localtools.py   -> devharness/sandbox/_jail.py
+  - vvaharness/backends/sdk.py          -> devharness/providers/anthropic.py (partial: ephemeral-cache marker)
   - vvaharness/orchestrator/store.py    -> devharness/session/store.py
   - vvaharness/config/__init__.py       -> devharness/config/__init__.py
   - vvaharness/report/redact.py         -> devharness/redaction/rules.py
@@ -64,6 +65,21 @@ Adapted files incorporated into devharness:
   - providers/base.py                   -> devharness/providers/base.py
   - agent/billing_usage.py              -> devharness/observability/cost.py (partial)
 
+-------------------------------------------------------------------------------
+DeepAgents (langchain-ai/deepagents)
+  License:  MIT License
+  Copyright (c) LangChain, Inc.
+  Upstream: https://github.com/langchain-ai/deepagents
+  Commit:   23b83ad50f63d241d0069a3dc426d43b211adf2e
+-------------------------------------------------------------------------------
+
+Adapted files incorporated into devharness:
+  - libs/deepagents/deepagents/middleware/summarization.py
+                                        -> devharness/loop/steps/compaction.py
+                                           (extract-pattern: trigger + keep-N +
+                                            summary persistence; no LangChain
+                                            imports)
+
 ===============================================================================
 Design references (no code lifted)
 ===============================================================================
@@ -76,7 +92,9 @@ copied. They are acknowledged here in gratitude, not as a legal requirement.
   - Block Goose      (Apache 2.0) - https://github.com/block/goose
                        Reference: state-machine step engine
   - DeepAgents       (MIT)        - https://github.com/langchain-ai/deepagents
-                       Reference: middleware composition, summarization pattern
+                       Reference: middleware composition; SubAgent TypedDict
+                                  shape (the summarization pattern is now a
+                                  code lift; see the DeepAgents section above)
   - Open SWE         (MIT)        - https://github.com/langchain-ai/open-swe
                        Reference: deterministic thread-id-from-surface pattern
   - Bedrock Engineer (MIT-0)      - https://github.com/aws-samples/bedrock-engineer

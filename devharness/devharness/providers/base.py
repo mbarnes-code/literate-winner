@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Iterator, Protocol, Tuple, runtime_checkable
+from typing import Any, Iterator, Literal, Protocol, Tuple, runtime_checkable
 
 logger = logging.getLogger(__name__)
 
@@ -237,9 +237,65 @@ class Provider(Protocol):
         ...
 
 
+# ─────────────────────────────────────────────────────────────
+# Wire types for Provider.stream() — devharness spec §4.3.
+# Kept alongside the Protocol so provider modules import a single symbol
+# set from ``providers.base``.  ``Request`` is the loop → provider payload;
+# ``StreamEvent`` is the tagged-union yield type.
+# ─────────────────────────────────────────────────────────────
+
+
+@dataclass(slots=True, frozen=True)
+class Request:
+    """Structured payload passed to ``Provider.stream``.
+
+    Determinism-critical fields (``temperature``, ``top_p``, ``seed``) are
+    populated by the loop and must NOT be silently rewritten by providers;
+    a provider that cannot honour them raises rather than downgrading.
+    """
+
+    messages: list[dict]
+    model: str
+    temperature: float = 0
+    top_p: float = 1
+    seed: int = 42
+    tools: list[dict] | None = None
+    tool_choice: str | dict | None = None
+    cache_control: dict | None = None
+    response_format: dict | None = None
+    max_tokens: int | None = None
+    stop: list[str] | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class StreamEvent:
+    """Tagged-union event yielded by ``Provider.stream``.
+
+    Only the fields relevant to ``kind`` are populated; the rest are
+    ``None``.  Consumers dispatch on ``kind``:
+
+    - ``text_delta``      → ``text``
+    - ``tool_call_delta`` → ``tool_call_id``, ``tool_name``, ``arguments_delta``
+    - ``usage``           → ``usage``  (``{input,output,cache_read,cache_write}``)
+    - ``finish``          → ``finish_reason``
+    - ``error``           → ``error``
+    """
+
+    kind: Literal["text_delta", "tool_call_delta", "usage", "finish", "error"]
+    text: str | None = None
+    tool_call_id: str | None = None
+    tool_name: str | None = None
+    arguments_delta: str | None = None
+    usage: dict | None = None
+    finish_reason: str | None = None
+    error: str | None = None
+
+
 __all__ = [
     "OMIT_TEMPERATURE",
     "Provider",
     "ProviderProfile",
+    "Request",
+    "StreamEvent",
     "profile_user_agent",
 ]
